@@ -8,7 +8,7 @@ giao diện web chạy cục bộ.
 
 ## Demo
 
-<video src="https://github.com/zixfelw/Change-2fa-Password-GPT-Auto/raw/main/demo.mp4" controls width="100%"></video>
+<video src="demo.mp4" controls width="100%"></video>
 
 ---
 
