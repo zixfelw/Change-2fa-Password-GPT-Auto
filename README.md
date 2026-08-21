@@ -6,16 +6,22 @@ giao diện web chạy cục bộ.
 > **Runtime:** Python 3.11–3.13 · **UI:** FastAPI + vanilla JS ·
 > **DB:** SQLite · **Browser:** Camoufox
 
+## Demo
+
+https://github.com/user-attachments/assets/demo.mp4
+
+https://github.com/zixfelw/Change-2fa-Password-GPT-Auto/raw/main/demo.mp4
+
 ---
 
 ## Chạy nhanh trên Windows
 
 ### 1. Giải nén source
 
-Sau khi tải ZIP, mở folder:
+Sau khi tải ZIP hoặc clone repo, mở thư mục chứa `khoidongoday.bat`:
 
 ```text
-Change-2fa-Password-GPT-Auto\change 2fa community\
+Change-2fa-Password-GPT-Auto\
 ```
 
 ### 2. Double-click `khoidongoday.bat`
