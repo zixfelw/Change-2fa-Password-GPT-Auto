@@ -1,0 +1,106 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Testing / type-checking caches
+.hypothesis/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime / data
+runtime/
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Secrets
+.env
+.env.local
+*.pem
+*.key
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Observability
+.omx/
+
+# Dev artifacts
+node_modules/
+.wrangler/
+test/web_ui_artifacts/
+test/out/
+codex-security-scan-*/
+*.zip
+test/playwright/
+.playwright-mcp
+captcha_*.png
+./*.png
+reg_blocked_step5_1779704711.png
+app.midtrans.com22.har
+gopay-link-service/target/
+test/ui_screenshots/
+data.ms
+
+
+# Kiro IDE / agent skills / planning
+.kiro/
+
+# GitNexus code intelligence cache (lớn, regenerate được)
+.gitnexus/
+
+# Internal planning docs (không share)
+.planning/
+
+# Reverse-engineered Android APK decoded
+test/L1-decompiled/
+
+# HAR captures (có thể chứa cookies/auth)
+*.har
+**/*.har
+
+# Local GitHub credential helper (nếu có)
+gh_switch.sh
+
+# Playwright MCP artifacts ở root
+/upi-tab-after-refactor.png
+/upi-qr-modal-demo.png
+/upi-modal-real-job.png
+.playwright-mcp/
+test/L2-apktool/
+test/L2-decompiled/
+plans
+
+# Real account credentials — NEVER commit (password / refresh_token / 2FA)
+test/accounts_cleaned.txt
+test/check_clean_credentials.py
+rust_upi_bot/target
+
+# PyInstaller build artifacts
+_expire_const.py
+playwright-browsers/
+*.spec.bak
+upi-mobile-after.png
