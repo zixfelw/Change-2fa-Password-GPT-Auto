@@ -8,6 +8,8 @@ giao diện web chạy cục bộ.
 
 ## Demo
 
+[Xem video demo](demo.mp4)
+
 <video src="demo.mp4" controls width="100%"></video>
 
 ---
