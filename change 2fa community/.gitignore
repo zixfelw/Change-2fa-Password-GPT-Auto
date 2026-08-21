@@ -24,6 +24,7 @@ htmlcov/
 # Runtime / data
 runtime/
 data/
+.setup-complete
 *.db
 *.db-shm
 *.db-wal

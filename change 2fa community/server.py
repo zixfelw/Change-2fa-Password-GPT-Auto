@@ -24,7 +24,19 @@ from pydantic import BaseModel, Field
 
 
 APP_DIR = Path(__file__).resolve().parent
-ROOT = APP_DIR.parent
+
+
+def _resolve_source_root(app_dir: Path) -> Path:
+    """Support both monorepo development and one-folder source releases."""
+    standalone_markers = (
+        app_dir / "_camoufox_runtime.py",
+        app_dir / "db" / "__init__.py",
+        app_dir / "camoufox-browser-spec.txt",
+    )
+    return app_dir if all(path.is_file() for path in standalone_markers) else app_dir.parent
+
+
+ROOT = _resolve_source_root(APP_DIR)
 STATIC_DIR = APP_DIR / "static"
 LEGACY_RUNTIME_DIR = APP_DIR / "runtime"
 
