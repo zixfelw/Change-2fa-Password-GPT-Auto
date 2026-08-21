@@ -8,9 +8,7 @@ giao diện web chạy cục bộ.
 
 ## Demo
 
-[Xem video demo](demo.mp4)
-
-<video src="demo.mp4" controls width="100%"></video>
+https://github.com/zixfelw/Change-2fa-Password-GPT-Auto/blob/main/demo.mp4
 
 ---
 
