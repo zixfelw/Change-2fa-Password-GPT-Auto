@@ -151,8 +151,8 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(
-    title="Infinity AI Store — Change 2FA Community",
-    description="Local-only TOTP rotation control plane",
+    title="Infinity AI Store — Tool change Password vs 2FA GPT",
+    description="Local-only Password and TOTP control plane",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -167,7 +167,7 @@ def require_token(x_auth_token: str | None = Header(default=None)) -> None:
 def bootstrap() -> dict[str, Any]:
     return {
         "brand": "Infinity AI Store",
-        "product": "Change 2FA Community",
+        "product": "Tool change Password vs 2FA GPT",
         "token": auth_token,
         "jobs": manager.snapshots(),
         "settings": manager.settings,
@@ -315,7 +315,7 @@ def _open_browser_when_ready(host: str, port: int) -> None:
 
 def main() -> None:
     global RUNTIME_PORT
-    parser = argparse.ArgumentParser(description="Change 2FA Community localhost")
+    parser = argparse.ArgumentParser(description="Tool change Password vs 2FA GPT localhost")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5033)
     parser.add_argument("--no-browser", action="store_true")

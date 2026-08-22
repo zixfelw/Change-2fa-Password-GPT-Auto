@@ -1,4 +1,4 @@
-# Change 2fa Password GPT - Auto
+# Tool change Password vs 2FA GPT
 
 Tự động kiểm tra, đổi mật khẩu và xoay TOTP 2FA cho tài khoản ChatGPT qua
 giao diện web chạy cục bộ.

@@ -9,7 +9,7 @@ set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 
 echo ============================================================
-echo   Change 2FA Password GPT - Auto
+echo   Tool change Password vs 2FA GPT
 echo   Cai dat lan dau tai: %ROOT_DIR%
 echo ============================================================
 echo.
