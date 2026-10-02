@@ -31,13 +31,20 @@
   function planLabel(job) {
     if (!job.plan) return 'CHƯA RÕ';
     const planUpper = String(job.plan).toUpperCase();
+    let text = planUpper;
     if (job.plan.toLowerCase() === 'plus' && job.plan_expires) {
       const expDate = formatPlanDate(job.plan_expires);
       if (expDate) {
-        return `PLUS (Hết: ${expDate})`;
+        text = `PLUS (Hết: ${expDate})`;
       }
     }
-    return planUpper;
+    if (job.is_trial) {
+      text += ' · TRIAL';
+    }
+    if (job.usage_summary) {
+      text += ` · Quota: ${job.usage_summary}`;
+    }
+    return text;
   }
 
   function statusLabel(job) {
@@ -52,7 +59,9 @@
       const expNotice = (job.plan && job.plan.toLowerCase() === 'plus' && job.plan_expires)
         ? ` · Hạn: ${formatPlanDate(job.plan_expires)}`
         : '';
-      return { label: `LIVE · ${planLabel(job)}`, className: 'live', detail: `Gói kiểm tra từ ${job.plan_source || 'session'}${expNotice}` };
+      const trialNotice = job.is_trial ? ' · Gói dùng thử (Trial)' : '';
+      const usageNotice = job.usage_summary ? ` · Quota: ${job.usage_summary}` : '';
+      return { label: `LIVE · ${planLabel(job)}`, className: 'live', detail: `Gói từ ${job.plan_source || 'session'}${expNotice}${trialNotice}${usageNotice}` };
     }
     if (job.error_kind === 'invalid_credentials') return { label: 'CHƯA XÁC MINH', className: 'unknown', detail: job.error || 'Thông tin đăng nhập hoặc 2FA không đúng' };
     return { label: 'CHƯA RÕ', className: 'unknown', detail: job.error || 'Chưa kiểm tra xong tài khoản' };
@@ -154,7 +163,7 @@
       const selected = state.selectedJob === job.id ? ' selected' : '';
       return `<tr data-id="${job.id}" class="job-row${selected}" title="${escapeHtml(job.error || '')}">
         <td class="account"><strong>${escapeHtml(job.email)}</strong><span>${job.id.slice(0, 10).toUpperCase()} · <b class="job-mode mode-${job.mode}">${escapeHtml(modeShort)}</b></span></td>
-        <td><span class="status ${job.status} ${job.plan ? `plan-${escapeHtml(job.plan)}` : ''}">${escapeHtml(statusLabel(job))}</span></td>
+        <td><span class="status ${job.status} ${job.plan ? `plan-${escapeHtml(job.plan)}` : ''} ${job.is_trial ? 'is-trial' : ''}">${escapeHtml(statusLabel(job))}</span></td>
         <td><div class="account-result"><span class="account-badge ${check.className}">${escapeHtml(check.label)}</span><small>${escapeHtml(checkpoint)}</small></div></td>
         <td>${job.retry_count}</td>
         <td><div class="row-actions">

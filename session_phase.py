@@ -2069,7 +2069,7 @@ def _parse_entitlement_plan(data: dict[str, Any]) -> dict[str, Any]:
     - Nếu tài khoản có nhiều account (Personal + Workspace), kiểm tra xem có workspace nào
       đang active không để phản ánh đúng quyền lợi của user.
     """
-    blank = {"plan": None, "is_plus": False, "has_active_subscription": False, "expires": None}
+    blank = {"plan": None, "is_plus": False, "has_active_subscription": False, "expires": None, "is_trial": False}
     if not isinstance(data, dict):
         return blank
     accounts = data.get("accounts")
@@ -2097,6 +2097,12 @@ def _parse_entitlement_plan(data: dict[str, Any]) -> dict[str, Any]:
 
     has_active = bool(ent.get("has_active_subscription"))
     expires_at = ent.get("expires_at")
+    is_trial = bool(
+        account_info.get("is_trial")
+        or ent.get("trial")
+        or acct.get("is_trial")
+        or str(account_info.get("trial_state") or "").strip().lower() in {"active", "in_trial", "true"}
+    )
 
     if has_active:
         plan = sub_label or _normalize_plan_name(account_info.get("plan_type")) or "plus"
@@ -2105,6 +2111,7 @@ def _parse_entitlement_plan(data: dict[str, Any]) -> dict[str, Any]:
             "is_plus": (plan == "plus"),
             "has_active_subscription": True,
             "expires": expires_at,
+            "is_trial": is_trial,
         }
 
     # Quét các account khác trong accounts (nếu có workspace Team/Plus đang active)
@@ -2116,11 +2123,18 @@ def _parse_entitlement_plan(data: dict[str, Any]) -> dict[str, Any]:
             cand_sub = _normalize_plan_name(cand_ent.get("subscription_plan"))
             cand_acc = candidate.get("account") if isinstance(candidate.get("account"), dict) else {}
             cand_plan = cand_sub or _normalize_plan_name(cand_acc.get("plan_type")) or "plus"
+            cand_trial = bool(
+                cand_acc.get("is_trial")
+                or cand_ent.get("trial")
+                or candidate.get("is_trial")
+                or str(cand_acc.get("trial_state") or "").strip().lower() in {"active", "in_trial", "true"}
+            )
             return {
                 "plan": cand_plan,
                 "is_plus": (cand_plan == "plus"),
                 "has_active_subscription": True,
                 "expires": cand_ent.get("expires_at"),
+                "is_trial": cand_trial,
             }
 
     # Không có subscription active → Tài khoản hiện tại là FREE
@@ -2129,6 +2143,7 @@ def _parse_entitlement_plan(data: dict[str, Any]) -> dict[str, Any]:
         "is_plus": False,
         "has_active_subscription": False,
         "expires": expires_at,
+        "is_trial": is_trial,
     }
 
 
@@ -2253,6 +2268,114 @@ async def fetch_codex_weekly_usage(
     except Exception as exc:
         raise SessionError(f"usage JSON parse fail: {_scrub_jwt(str(exc))}") from exc
     return _parse_codex_weekly_usage(data)
+
+
+def _parse_account_usage(data: dict[str, Any]) -> dict[str, Any]:
+    """Parse usage/rate limit block từ /backend-api/wham/usage."""
+    if not isinstance(data, dict):
+        raise SessionError("usage response is not an object")
+    rate_limit = data.get("rate_limit")
+    if not isinstance(rate_limit, dict):
+        raise SessionError("usage response missing rate_limit")
+
+    allowed = bool(rate_limit.get("allowed", True))
+    limit_reached = bool(rate_limit.get("limit_reached", False))
+
+    window = rate_limit.get("secondary_window") or rate_limit.get("primary_window")
+    used_percent = 0.0
+    if isinstance(window, dict) and "used_percent" in window:
+        try:
+            val = float(window["used_percent"])
+            if not isinstance(window["used_percent"], bool) and 0 <= val <= 100:
+                used_percent = round(val, 1)
+        except (ValueError, TypeError):
+            pass
+
+    remaining_percent = max(0.0, round(100.0 - used_percent, 1))
+
+    if limit_reached or not allowed:
+        status_text = "Chạm giới hạn"
+    elif used_percent > 0:
+        status_text = f"Còn {remaining_percent}%"
+    else:
+        status_text = "Còn 100%"
+
+    return {
+        "allowed": allowed,
+        "limit_reached": limit_reached,
+        "used_percent": used_percent,
+        "remaining_percent": remaining_percent,
+        "status_text": status_text,
+    }
+
+
+async def fetch_account_usage(
+    *,
+    access_token: str,
+    account_id: str | None = None,
+    cookies: Any = None,
+    proxy: str | None = None,
+    timeout: float = 15.0,
+    impersonate: str | None = None,
+) -> dict[str, Any]:
+    """Fetch user rate limits & usage quota từ /backend-api/wham/usage."""
+    _ensure_ascii_cacert()
+    from curl_cffi.requests import AsyncSession
+    from user_agent_profile import (
+        CURL_IMPERSONATE_PRIMARY,
+        SEC_CH_UA,
+        SEC_CH_UA_MOBILE,
+        SEC_CH_UA_PLATFORM,
+        WINDOWS_USER_AGENT,
+    )
+
+    if not isinstance(access_token, str) or not access_token.strip():
+        raise SessionError("usage check requires access_token")
+    if impersonate is None:
+        impersonate = CURL_IMPERSONATE_PRIMARY
+
+    target = "/backend-api/wham/usage"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://chatgpt.com",
+        "Referer": "https://chatgpt.com/",
+        "User-Agent": WINDOWS_USER_AGENT,
+        "sec-ch-ua": SEC_CH_UA,
+        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "x-openai-target-path": target,
+        "x-openai-target-route": target,
+        "OAI-Language": "en-US",
+    }
+    if isinstance(account_id, str) and account_id.strip():
+        headers["ChatGPT-Account-Id"] = account_id.strip()
+    cookie_header = _cookies_to_header(cookies) if cookies else ""
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    async with AsyncSession(impersonate=impersonate, proxies=proxies) as session:
+        try:
+            response = await session.get(
+                f"https://chatgpt.com{target}",
+                headers=headers,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            raise SessionError(f"usage network error: {_scrub_jwt(str(exc))}") from exc
+
+    if response.status_code != 200:
+        raise SessionError(f"usage check HTTP {response.status_code}")
+    try:
+        data = response.json()
+    except Exception as exc:
+        raise SessionError(f"usage JSON parse fail: {_scrub_jwt(str(exc))}") from exc
+    return _parse_account_usage(data)
 
 
 async def fetch_account_entitlement(

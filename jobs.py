@@ -30,6 +30,9 @@ class TwoFAJob:
     plan: str | None = None
     plan_source: str | None = None
     plan_expires: str | None = None
+    is_trial: bool | None = None
+    usage_summary: str | None = None
+    usage_info: dict[str, Any] | None = None
     rotated_pending_verify: bool = False
     password_changed: bool = False   # password đã được đổi thành công
     login_verified: bool = False
@@ -56,6 +59,9 @@ class TwoFAJob:
             "plan": self.plan,
             "plan_source": self.plan_source,
             "plan_expires": self.plan_expires,
+            "is_trial": self.is_trial,
+            "usage_summary": self.usage_summary,
+            "usage_info": self.usage_info,
             "retryable": self.retryable,
             "rotated_pending_verify": self.rotated_pending_verify,
             "password_changed": self.password_changed,
@@ -144,6 +150,9 @@ class TwoFAJobManager:
                 plan=state.get("plan"),
                 plan_source=state.get("plan_source"),
                 plan_expires=state.get("plan_expires"),
+                is_trial=state.get("is_trial"),
+                usage_summary=state.get("usage_summary"),
+                usage_info=state.get("usage_info"),
                 rotated_pending_verify=bool(state.get("rotated_pending_verify")),
                 password_changed=bool(state.get("password_changed")),
                 login_verified=bool(state.get("login_verified")),
@@ -181,6 +190,9 @@ class TwoFAJobManager:
             "plan": job.plan,
             "plan_source": job.plan_source,
             "plan_expires": job.plan_expires,
+            "is_trial": job.is_trial,
+            "usage_summary": job.usage_summary,
+            "usage_info": job.usage_info,
             "new_password": job.new_password,
         }, ensure_ascii=False)
 
@@ -389,6 +401,9 @@ class TwoFAJobManager:
             job.plan = result.plan
             job.plan_source = result.plan_source
             job.plan_expires = result.plan_expires
+            job.is_trial = result.is_trial
+            job.usage_summary = result.usage_summary
+            job.usage_info = result.usage_info
             job.error_kind = None
             job.rotated_pending_verify = False
             job.status = "success"

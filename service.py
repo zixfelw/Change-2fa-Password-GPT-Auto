@@ -38,6 +38,9 @@ class RotationResult:
     plan: str | None = None
     plan_source: str | None = None
     plan_expires: str | None = None
+    is_trial: bool | None = None
+    usage_summary: str | None = None
+    usage_info: dict[str, Any] | None = None
 
 
 class TwoFAService:
@@ -207,51 +210,84 @@ class TwoFAService:
         session: dict[str, Any],
         timeout: float,
         log: LogFn,
-    ) -> tuple[str | None, str | None, str | None]:
-        from session_phase import fetch_account_entitlement
+    ) -> tuple[str | None, str | None, str | None, bool | None, str | None, dict[str, Any] | None]:
+        from session_phase import fetch_account_entitlement, fetch_account_usage
 
         fallback = self._session_plan(session)
         entitlement_fn = self._entitlement_fn or fetch_account_entitlement
-        try:
-            payload = await asyncio.wait_for(
-                entitlement_fn(
-                    access_token=str(session["accessToken"]),
-                    cookies=session.get("__cookies"),
-                    proxy=None,
-                    timeout=min(timeout, 20.0),
-                ),
-                timeout=min(timeout, 25.0),
+        token = str(session["accessToken"])
+        cookies = session.get("__cookies")
+        account_id = None
+        if isinstance(session.get("account"), dict):
+            account_id = session["account"].get("id")
+
+        async def _do_entitlement():
+            return await entitlement_fn(
+                access_token=token,
+                cookies=cookies,
+                proxy=None,
+                timeout=min(timeout, 20.0),
             )
-            has_active = bool(payload.get("has_active_subscription"))
-            is_plus = bool(payload.get("is_plus"))
-            ent_plan = payload.get("plan")
-            raw_expires = payload.get("expires")
-            plan_expires = str(raw_expires) if raw_expires else None
 
-            if is_plus:
-                plan = "plus"
-                date_str = plan_expires[:10] if plan_expires else ""
-                date_msg = f" (Hết hạn: {date_str})" if date_str else ""
-                log(f"[account] Tài khoản live · gói PLUS{date_msg}")
-            elif has_active and ent_plan:
-                plan = str(ent_plan).strip().casefold()
-                date_str = plan_expires[:10] if plan_expires else ""
-                date_msg = f" (Hết hạn: {date_str})" if date_str else ""
-                log(f"[account] Tài khoản live · gói {plan.upper()}{date_msg}")
-            else:
-                plan = "free"
-                plan_expires = None
-                log(f"[account] Tài khoản live · gói FREE")
+        async def _do_usage():
+            return await fetch_account_usage(
+                access_token=token,
+                account_id=account_id,
+                cookies=cookies,
+                proxy=None,
+                timeout=min(timeout, 15.0),
+            )
 
-            return plan, "entitlement", plan_expires
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
+        ent_res, usage_res = await asyncio.gather(
+            asyncio.wait_for(_do_entitlement(), timeout=min(timeout, 25.0)),
+            asyncio.wait_for(_do_usage(), timeout=min(timeout, 18.0)),
+            return_exceptions=True,
+        )
+
+        usage_summary = None
+        usage_info = None
+        if isinstance(usage_res, dict):
+            usage_info = usage_res
+            usage_summary = usage_res.get("status_text")
+        elif isinstance(usage_res, Exception) and not isinstance(usage_res, asyncio.CancelledError):
+            pass
+
+        if isinstance(ent_res, Exception):
+            if isinstance(ent_res, asyncio.CancelledError):
+                raise ent_res
             if fallback:
                 log(f"[account] Entitlement chưa đọc được; dùng session plan {fallback.upper()}")
-                return fallback, "session", None
-            log(f"[account] Chưa xác định được gói: {type(exc).__name__}")
-            return None, None, None
+                return fallback, "session", None, False, usage_summary, usage_info
+            log(f"[account] Chưa xác định được gói: {type(ent_res).__name__}")
+            return None, None, None, None, usage_summary, usage_info
+
+        payload = ent_res
+        has_active = bool(payload.get("has_active_subscription"))
+        is_plus = bool(payload.get("is_plus"))
+        is_trial = bool(payload.get("is_trial"))
+        ent_plan = payload.get("plan")
+        raw_expires = payload.get("expires")
+        plan_expires = str(raw_expires) if raw_expires else None
+
+        trial_suffix = " · TRIAL" if is_trial else ""
+        quota_suffix = f" · Quota: {usage_summary}" if usage_summary else ""
+
+        if is_plus:
+            plan = "plus"
+            date_str = plan_expires[:10] if plan_expires else ""
+            date_msg = f" (Hết hạn: {date_str})" if date_str else ""
+            log(f"[account] Tài khoản live · gói PLUS{date_msg}{trial_suffix}{quota_suffix}")
+        elif has_active and ent_plan:
+            plan = str(ent_plan).strip().casefold()
+            date_str = plan_expires[:10] if plan_expires else ""
+            date_msg = f" (Hết hạn: {date_str})" if date_str else ""
+            log(f"[account] Tài khoản live · gói {plan.upper()}{date_msg}{trial_suffix}{quota_suffix}")
+        else:
+            plan = "free"
+            plan_expires = None
+            log(f"[account] Tài khoản live · gói FREE{trial_suffix}{quota_suffix}")
+
+        return plan, "entitlement", plan_expires, is_trial, usage_summary, usage_info
 
     async def check(
         self,
@@ -271,18 +307,20 @@ class TwoFAService:
             timeout=timeout,
             log=log,
         )
-        log("[2/2] 📋 Đang kiểm tra gói dịch vụ (Free/Plus)...")
-        plan, plan_source, plan_expires = await self._check_plan(
+        log("[2/2] 📋 Đang kiểm tra gói dịch vụ (Free/Plus), Trial & Quota...")
+        plan, plan_source, plan_expires, is_trial, usage_summary, usage_info = await self._check_plan(
             session=session,
             timeout=timeout,
             log=log,
         )
         plan_str = (plan or "free").upper()
+        trial_str = " · TRIAL" if is_trial else ""
+        quota_str = f" · Quota: {usage_summary}" if usage_summary else ""
         if plan == "plus" and plan_expires:
             date_short = plan_expires[:10]
-            log(f"[HOÀN TẤT] Kiểm tra thành công — Gói: PLUS (Hết hạn: {date_short}) (Không thay đổi 2FA)")
+            log(f"[HOÀN TẤT] Kiểm tra thành công — Gói: PLUS (Hết hạn: {date_short}){trial_str}{quota_str} (Không thay đổi 2FA)")
         else:
-            log(f"[HOÀN TẤT] Kiểm tra thành công — Gói: {plan_str} (Không thay đổi 2FA)")
+            log(f"[HOÀN TẤT] Kiểm tra thành công — Gói: {plan_str}{trial_str}{quota_str} (Không thay đổi 2FA)")
         return RotationResult(
             secret=secret,
             login_verified=True,
@@ -290,6 +328,9 @@ class TwoFAService:
             plan=plan,
             plan_source=plan_source,
             plan_expires=plan_expires,
+            is_trial=is_trial,
+            usage_summary=usage_summary,
+            usage_info=usage_info,
         )
 
     async def rotate(
@@ -312,7 +353,7 @@ class TwoFAService:
             log=log,
         )
         access_token = str(session["accessToken"])
-        plan, plan_source, plan_expires = await self._check_plan(
+        plan, plan_source, plan_expires, is_trial, usage_summary, usage_info = await self._check_plan(
             session=session,
             timeout=timeout,
             log=log,
@@ -375,6 +416,9 @@ class TwoFAService:
             plan=plan,
             plan_source=plan_source,
             plan_expires=plan_expires,
+            is_trial=is_trial,
+            usage_summary=usage_summary,
+            usage_info=usage_info,
         )
 
     async def verify(
@@ -395,7 +439,7 @@ class TwoFAService:
             timeout=timeout,
             log=log,
         )
-        plan, plan_source, plan_expires = await self._check_plan(
+        plan, plan_source, plan_expires, is_trial, usage_summary, usage_info = await self._check_plan(
             session=session,
             timeout=timeout,
             log=log,
@@ -408,6 +452,9 @@ class TwoFAService:
             plan=plan,
             plan_source=plan_source,
             plan_expires=plan_expires,
+            is_trial=is_trial,
+            usage_summary=usage_summary,
+            usage_info=usage_info,
         )
 
     async def change_password(
@@ -429,7 +476,7 @@ class TwoFAService:
             timeout=timeout,
             log=log,
         )
-        plan, plan_source, plan_expires = await self._check_plan(
+        plan, plan_source, plan_expires, is_trial, usage_summary, usage_info = await self._check_plan(
             session=session,
             timeout=timeout,
             log=log,
@@ -468,7 +515,7 @@ class TwoFAService:
             timeout=timeout,
             log=log,
         )
-        plan2, plan_source2, plan_expires2 = await self._check_plan(
+        plan2, plan_source2, plan_expires2, is_trial2, usage_summary2, usage_info2 = await self._check_plan(
             session=session2,
             timeout=timeout,
             log=log,
@@ -481,6 +528,9 @@ class TwoFAService:
             plan=plan2 or plan,
             plan_source=plan_source2 or plan_source,
             plan_expires=plan_expires2 or plan_expires,
+            is_trial=is_trial2 if is_trial2 is not None else is_trial,
+            usage_summary=usage_summary2 or usage_summary,
+            usage_info=usage_info2 or usage_info,
         )
 
     async def rotate_with_password(
@@ -502,7 +552,7 @@ class TwoFAService:
             timeout=timeout,
             log=log,
         )
-        plan, plan_source, plan_expires = await self._check_plan(
+        plan, plan_source, plan_expires, is_trial, usage_summary, usage_info = await self._check_plan(
             session=session,
             timeout=timeout,
             log=log,
@@ -602,4 +652,7 @@ class TwoFAService:
             plan=plan,
             plan_source=plan_source,
             plan_expires=plan_expires,
+            is_trial=is_trial,
+            usage_summary=usage_summary,
+            usage_info=usage_info,
         )
