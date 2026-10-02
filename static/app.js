@@ -16,8 +16,28 @@
     change_password_and_2fa: { short: 'PASS + 2FA', title: 'Đổi Password & 2FA', icon: '⬡', description: 'Đổi mật khẩu trước, rồi đổi khóa TOTP — cả hai đều được xác minh.' },
   };
 
+  function formatPlanDate(isoStr) {
+    if (!isoStr) return '';
+    try {
+      const d = new Date(isoStr);
+      if (!isNaN(d.getTime())) {
+        const pad = (n) => String(n).padStart(2, '0');
+        return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}`;
+      }
+    } catch (_) {}
+    return String(isoStr).slice(0, 10);
+  }
+
   function planLabel(job) {
-    return job.plan ? String(job.plan).toUpperCase() : 'CHƯA RÕ';
+    if (!job.plan) return 'CHƯA RÕ';
+    const planUpper = String(job.plan).toUpperCase();
+    if (job.plan.toLowerCase() === 'plus' && job.plan_expires) {
+      const expDate = formatPlanDate(job.plan_expires);
+      if (expDate) {
+        return `PLUS (Hết: ${expDate})`;
+      }
+    }
+    return planUpper;
   }
 
   function statusLabel(job) {
@@ -28,7 +48,12 @@
 
   function accountCheck(job) {
     if (job.account_state === 'die') return { label: 'DIE', className: 'die', detail: job.error || 'Tài khoản đã bị vô hiệu hóa' };
-    if (job.account_state === 'live') return { label: `LIVE · ${planLabel(job)}`, className: 'live', detail: `Gói kiểm tra từ ${job.plan_source || 'session'}` };
+    if (job.account_state === 'live') {
+      const expNotice = (job.plan && job.plan.toLowerCase() === 'plus' && job.plan_expires)
+        ? ` · Hạn: ${formatPlanDate(job.plan_expires)}`
+        : '';
+      return { label: `LIVE · ${planLabel(job)}`, className: 'live', detail: `Gói kiểm tra từ ${job.plan_source || 'session'}${expNotice}` };
+    }
     if (job.error_kind === 'invalid_credentials') return { label: 'CHƯA XÁC MINH', className: 'unknown', detail: job.error || 'Thông tin đăng nhập hoặc 2FA không đúng' };
     return { label: 'CHƯA RÕ', className: 'unknown', detail: job.error || 'Chưa kiểm tra xong tài khoản' };
   }

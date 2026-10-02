@@ -29,6 +29,7 @@ class TwoFAJob:
     account_state: str = "unknown"
     plan: str | None = None
     plan_source: str | None = None
+    plan_expires: str | None = None
     rotated_pending_verify: bool = False
     password_changed: bool = False   # password đã được đổi thành công
     login_verified: bool = False
@@ -54,6 +55,7 @@ class TwoFAJob:
             "account_state": self.account_state,
             "plan": self.plan,
             "plan_source": self.plan_source,
+            "plan_expires": self.plan_expires,
             "retryable": self.retryable,
             "rotated_pending_verify": self.rotated_pending_verify,
             "password_changed": self.password_changed,
@@ -141,6 +143,7 @@ class TwoFAJobManager:
                 account_state=str(state.get("account_state") or legacy_account_state),
                 plan=state.get("plan"),
                 plan_source=state.get("plan_source"),
+                plan_expires=state.get("plan_expires"),
                 rotated_pending_verify=bool(state.get("rotated_pending_verify")),
                 password_changed=bool(state.get("password_changed")),
                 login_verified=bool(state.get("login_verified")),
@@ -177,6 +180,7 @@ class TwoFAJobManager:
             "account_state": job.account_state,
             "plan": job.plan,
             "plan_source": job.plan_source,
+            "plan_expires": job.plan_expires,
             "new_password": job.new_password,
         }, ensure_ascii=False)
 
@@ -384,6 +388,7 @@ class TwoFAJobManager:
             job.account_state = result.account_state
             job.plan = result.plan
             job.plan_source = result.plan_source
+            job.plan_expires = result.plan_expires
             job.error_kind = None
             job.rotated_pending_verify = False
             job.status = "success"
