@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 SENTINEL_REQ_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
 SENTINEL_REFERER = "https://sentinel.openai.com/backend-api/sentinel/frame.html"
-SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260124ceb8/sdk.js"
+SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260810913b/sdk.js"
 
 # UA + sec-ch-ua đồng bộ với user_agent_profile (Windows + Chrome stable). Trước
 # refactor sentinel hardcode Windows Chrome 145 trong khi request_phase hardcode
@@ -121,7 +121,7 @@ def _get_config(device_id: str, user_agent: str) -> list:
         None,
         None,
         "en-US",
-        "en-US,en",
+        int(random.uniform(5, 50)),
         random.random(),
         f"{nav_prop}−undefined",
         random.choice(["location", "implementation", "URL", "documentURI", "compatMode"]),
@@ -143,7 +143,7 @@ def _solve_pow(seed: str, difficulty: str, device_id: str, user_agent: str) -> s
         config[9] = round((time.time() - start_time) * 1000)
         encoded = _b64_encode(config)
         digest = _fnv1a_32(seed + encoded)
-        if digest[: len(difficulty)] <= difficulty:
+        if len(difficulty) <= 8 and digest[: len(difficulty)] <= difficulty:
             return "gAAAAAB" + encoded + "~S"
     return "gAAAAAB" + ERROR_PREFIX + _b64_encode(str(None))
 
@@ -155,7 +155,13 @@ def _generate_requirements_token(device_id: str, user_agent: str) -> str:
     return "gAAAAAC" + _b64_encode(config)
 
 
-def _fetch_challenge(session, device_id: str, flow: str, request_p: str) -> dict | None:
+def _fetch_challenge(
+    session,
+    device_id: str,
+    flow: str,
+    request_p: str,
+    user_agent: str = DEFAULT_UA,
+) -> dict | None:
     """POST /sentinel/req → challenge JSON."""
     body = {"p": request_p, "id": device_id, "flow": flow}
     headers = {
@@ -164,7 +170,7 @@ def _fetch_challenge(session, device_id: str, flow: str, request_p: str) -> dict
         "Accept-Encoding": "gzip, deflate, br, zstd",
         "Referer": SENTINEL_REFERER,
         "Origin": "https://sentinel.openai.com",
-        "User-Agent": DEFAULT_UA,
+        "User-Agent": user_agent,
         "sec-ch-ua": DEFAULT_SEC_CH_UA,
         "sec-ch-ua-mobile": "?0",
         'sec-ch-ua-platform': '"Windows"',
@@ -241,8 +247,7 @@ def get_sentinel_token(
     """Build sentinel token via pure-Python PoW. Always returns a string (never raises)."""
     did = device_id or str(uuid.uuid4())
     req_p = _generate_requirements_token(did, user_agent)
-
-    challenge = _fetch_challenge(session, did, flow, req_p)
+    challenge = _fetch_challenge(session, did, flow, req_p, user_agent=user_agent)
     if not challenge:
         logger.warning("Sentinel challenge fetch failed, returning fallback token")
         return json.dumps(

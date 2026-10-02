@@ -64,6 +64,7 @@ class TwoFAJob:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "log_tail": self.logs[-3:],
+            "logs": self.logs,
         }
 
 
@@ -401,16 +402,26 @@ class TwoFAJobManager:
             )
         except Exception as exc:
             job.status = "error"
-            job.error = (str(exc).strip() or type(exc).__name__)[:240]
+            raw_err = (str(exc).strip() or type(exc).__name__)
+            # Bỏ bớt prefix rườm rà nếu có
+            clean_err = raw_err
+            for prefix in ("TwoFAFlowError: ", "SessionError: ", "LoginError: ", "Exception: "):
+                if clean_err.startswith(prefix):
+                    clean_err = clean_err[len(prefix):]
+            clean_err = clean_err[:240]
+            job.error = clean_err
             job.error_kind = str(getattr(exc, "error_kind", "technical_error"))
             job.account_state = str(getattr(exc, "account_state", job.account_state))
             job.finished_at = time.time()
+            log(f"❌ [LỖI] {clean_err}")
             self.job_repo.update_status(
                 job.id, "error", error=job.error,
                 secret=job.secret, account_check=self._state(job),
             )
             if self._should_auto_retry(job):
                 delay = float(self.settings["twofa.auto_retry_delay"])
+                max_retry = int(self.settings["twofa.auto_retry_max"])
+                log(f"⏳ [TỰ ĐỘNG THỬ LẠI] Phát hiện lỗi tạm thời — Đang chuẩn bị thử lại lần {job.retry_count + 1}/{max_retry} sau {delay:.0f}s...")
                 asyncio.create_task(self._delayed_retry(job.id, delay))
         finally:
             self._broadcast(job)
@@ -425,7 +436,10 @@ class TwoFAJobManager:
     async def _delayed_retry(self, job_id: str, delay: float) -> None:
         await asyncio.sleep(delay)
         if job_id in self.jobs and self.jobs[job_id].status == "error":
-            self.retry(job_id)
+            try:
+                self.retry(job_id)
+            except Exception:
+                pass
 
     def retry(self, job_id: str) -> dict[str, Any]:
         job = self._require(job_id)
@@ -439,6 +453,12 @@ class TwoFAJobManager:
         job.error = None
         job.error_kind = None
         job.finished_at = None
+        retry_msg = f"🔄 [THỬ LẠI] Bắt đầu lượt thử lại lần {job.retry_count}..."
+        job.logs.append(retry_msg)
+        try:
+            self.job_repo.add_log(job.id, retry_msg)
+        except Exception:
+            pass
         self.job_repo.update_status(
             job.id, "queued", secret=job.secret,
             password=job.password, account_check=self._state(job),

@@ -78,6 +78,37 @@ class TwoFAService:
 
         return generate_random_password(previous_password=current_password)
 
+    @staticmethod
+    def _clean_error_message(exc: BaseException | str | None) -> str:
+        if exc is None:
+            return "Lỗi không xác định"
+        msg = str(exc).strip()
+        msg_lower = msg.lower()
+        if "account deactivated" in msg_lower or "deactivated" in msg_lower or "banned" in msg_lower:
+            return "Tài khoản bị vô hiệu hóa hoặc xóa (Account Deactivated)"
+        if "invalid_password" in msg_lower or "sai mật khẩu" in msg_lower or "invalid credential" in msg_lower or "invalid password" in msg_lower:
+            return "Sai mật khẩu tài khoản"
+        if "push_auth_required" in msg_lower or "push auth" in msg_lower:
+            return "Tài khoản yêu cầu phê duyệt trên điện thoại (Push Auth)"
+        if "2fa_failed" in msg_lower or "mã 2fa" in msg_lower or "incorrect_code" in msg_lower:
+            return "Mã 2FA (OTP) không đúng hoặc Secret cũ không khớp"
+        if "không có secret" in msg_lower or "thiếu secret" in msg_lower:
+            return "Tài khoản yêu cầu 2FA nhưng không có mã Secret"
+        if "cloudflare challenge" in msg_lower or "http 403" in msg_lower:
+            return "Cloudflare chặn kết nối (HTTP 403)"
+        if "timeout" in msg_lower:
+            return "Quá thời gian chờ phản hồi từ OpenAI (Timeout)"
+        if "too many redirect" in msg_lower:
+            return "Lỗi vòng lặp chuyển hướng kết nối"
+        if "network" in msg_lower or "transport" in msg_lower:
+            return "Lỗi kết nối mạng tới OpenAI"
+        # Làm sạch các prefix exception
+        clean = msg.splitlines()[0] if msg else "Lỗi không xác định"
+        for prefix in ("SessionError: ", "TwoFAFlowError: ", "LoginError: ", "Exception: "):
+            if clean.startswith(prefix):
+                clean = clean[len(prefix):]
+        return clean[:140]
+
     async def _login(
         self,
         *,
@@ -109,32 +140,35 @@ class TwoFAService:
                 )
                 token = session.get("accessToken")
                 if not isinstance(token, str) or not token.strip():
-                    raise TwoFAFlowError("Đăng nhập không trả về access token")
+                    raise TwoFAFlowError("Đăng nhập không trả về access token", error_kind="technical_error")
                 return session
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 last_error = exc
-                if is_fatal_login_error(exc) or attempt >= self._login_attempts:
+                fatal = is_fatal_login_error(exc)
+                if fatal or attempt >= self._login_attempts:
                     break
-                log(f"[login] lần {attempt}/{self._login_attempts} chưa thành công — thử lại...")
+                clean_err = self._clean_error_message(exc)
+                log(f"   ⚠️ [Thử lại {attempt}/{self._login_attempts}] Kết nối tạm thời gián đoạn ({clean_err}). Đang kết nối lại sau {self._retry_delay:.0f}s...")
                 await asyncio.sleep(self._retry_delay)
-        detail = str(last_error).strip() if last_error else "unknown login error"
+
         account_state = (
             "die"
             if classify_account_check_error(last_error) == "deactivated"
             else "unknown"
         )
+        is_fatal = last_error is not None and is_fatal_login_error(last_error)
         error_kind = (
             "account_die"
             if account_state == "die"
             else "invalid_credentials"
-            if last_error is not None and is_fatal_login_error(last_error)
+            if is_fatal
             else "technical_error"
         )
-        label = "Tài khoản die" if account_state == "die" else "Đăng nhập thất bại"
+        clean_msg = self._clean_error_message(last_error)
         raise TwoFAFlowError(
-            f"{label}: {detail[:220]}",
+            clean_msg,
             error_kind=error_kind,
             account_state=account_state,
         ) from last_error
@@ -193,7 +227,7 @@ class TwoFAService:
         log: LogFn,
     ) -> RotationResult:
         """Authenticate and classify the account without changing its TOTP secret."""
-        log("[1/2] Đang xác thực tài khoản — chế độ chỉ kiểm tra...")
+        log("[1/2] 🔑 Đang đăng nhập kiểm tra tài khoản...")
         session = await self._login(
             email=email,
             password=password,
@@ -201,12 +235,14 @@ class TwoFAService:
             timeout=timeout,
             log=log,
         )
+        log("[2/2] 📋 Đang kiểm tra gói dịch vụ (Free/Plus)...")
         plan, plan_source = await self._check_plan(
             session=session,
             timeout=timeout,
             log=log,
         )
-        log("[done] Đã kiểm tra tài khoản; không thay đổi 2FA")
+        plan_str = (plan or "free").upper()
+        log(f"[HOÀN TẤT] Kiểm tra thành công — Gói: {plan_str} (Không thay đổi 2FA)")
         return RotationResult(
             secret=secret,
             login_verified=True,
@@ -226,7 +262,7 @@ class TwoFAService:
         log: LogFn,
     ) -> RotationResult:
         """Rotate once and persist the new secret before fresh-login verification."""
-        log("[1/3] Đang xác thực tài khoản với 2FA hiện tại...")
+        log("[1/3] 🔑 Đang đăng nhập bằng 2FA hiện tại...")
         session = await self._login(
             email=email,
             password=password,
@@ -241,31 +277,48 @@ class TwoFAService:
             log=log,
         )
 
-        log("[2/3] Đang thay thế khóa TOTP...")
+        log("[2/3] 🔄 Đang đổi mã 2FA an toàn (Safe-Lock)...")
         _, default_rotate = self._resolve_dependencies()
         rotate_fn = self._rotate_fn or default_rotate
+
+        async def _early_checkpoint(data: dict[str, Any]) -> None:
+            sec = str(data.get("secret") or "").strip()
+            if sec:
+                await checkpoint(sec)
+                masked = f"{sec[:6]}...{sec[-4:]}" if len(sec) > 10 else sec
+                log(f"   ↳ [Safe-Lock] Đã lưu mã Secret mới vào hệ thống ({masked})")
+
         try:
+            # Cho phép tối thiểu 60s để các vòng retry Safe-Lock hoàn thành mà không bị cancel
+            rotate_timeout = max(timeout, 60.0)
             payload = await asyncio.wait_for(
                 rotate_fn(
                     access_token=access_token,
                     cookies=session.get("__cookies"),
                     proxy=None,
+                    on_enroll=_early_checkpoint,
                     log=log,
                 ),
-                timeout=timeout,
+                timeout=rotate_timeout,
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            detail = str(exc).strip() or type(exc).__name__
-            raise TwoFAFlowError(f"Đổi 2FA thất bại: {detail[:220]}") from exc
+            partial = getattr(exc, "partial_state", None)
+            if isinstance(partial, dict) and partial.get("secret"):
+                try:
+                    await checkpoint(str(partial["secret"]))
+                    log("   ↳ [Cứu hộ Safe-Lock] Đã lưu emergency secret vào hệ thống trước khi báo lỗi!")
+                except Exception:
+                    pass
+            detail = self._clean_error_message(exc)
+            raise TwoFAFlowError(f"Đổi 2FA thất bại: {detail}", error_kind="technical_error") from exc
 
         new_secret = str(payload.get("secret") or "").strip()
         if payload.get("activated") is not True or not new_secret:
-            raise TwoFAFlowError("Secret mới chưa được kích hoạt")
+            raise TwoFAFlowError("Secret mới chưa được kích hoạt thành công trên OpenAI", error_kind="technical_error")
 
         await checkpoint(new_secret)
-        log("[checkpoint] Secret mới đã được lưu an toàn")
         await self.verify(
             email=email,
             password=password,
@@ -273,6 +326,7 @@ class TwoFAService:
             timeout=timeout,
             log=log,
         )
+        log(f"[THÀNH CÔNG] Đổi 2FA hoàn tất an toàn! Khóa mới: {new_secret}")
         return RotationResult(
             secret=new_secret,
             login_verified=True,
@@ -291,7 +345,7 @@ class TwoFAService:
         log: LogFn,
     ) -> RotationResult:
         """Verify an already-checkpointed secret without rotating again."""
-        log("[3/3] Đang đăng nhập lại bằng 2FA mới...")
+        log("[3/3] 🛡️ Đang đăng nhập xác minh bằng 2FA mới...")
         session = await self._login(
             email=email,
             password=password,
@@ -304,7 +358,7 @@ class TwoFAService:
             timeout=timeout,
             log=log,
         )
-        log("[done] 2FA mới đã được xác minh thành công")
+        log("   ↳ [Xác minh] Đăng nhập thành công với mã 2FA mới!")
         return RotationResult(
             secret=new_secret,
             login_verified=True,
@@ -324,7 +378,7 @@ class TwoFAService:
         log: LogFn,
     ) -> RotationResult:
         """Đổi mật khẩu — giữ nguyên 2FA. Checkpoint ngay sau khi đổi xong."""
-        log("[1/3] Đang đăng nhập để đổi mật khẩu...")
+        log("[1/3] 🔑 Đang đăng nhập tài khoản để đổi mật khẩu...")
         session = await self._login(
             email=email,
             password=password,
@@ -338,10 +392,9 @@ class TwoFAService:
             log=log,
         )
 
-        log("[2/3] Đang tạo mật khẩu mới...")
+        log("[2/3] 🔐 Đang tạo và đổi mật khẩu mới...")
         new_password = self._generate_new_password(password)
 
-        log("[2/3] Đang đổi mật khẩu qua Account UI...")
         change_fn = self._change_password_fn or self._resolve_password_fn()
         try:
             await asyncio.wait_for(
@@ -358,13 +411,13 @@ class TwoFAService:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            detail = str(exc).strip() or type(exc).__name__
-            raise TwoFAFlowError(f"Đổi mật khẩu thất bại: {detail[:220]}") from exc
+            detail = self._clean_error_message(exc)
+            raise TwoFAFlowError(f"Đổi mật khẩu thất bại: {detail}", error_kind="technical_error") from exc
 
         await checkpoint(new_password, secret)
-        log("[checkpoint] Mật khẩu mới đã được lưu an toàn")
+        log(f"   ↳ [Safe-Lock] Mật khẩu mới đã được lưu an toàn: {new_password}")
 
-        log("[3/3] Đang xác minh đăng nhập với mật khẩu mới...")
+        log("[3/3] 🛡️ Đang đăng nhập kiểm tra lại bằng mật khẩu mới...")
         session2 = await self._login(
             email=email,
             password=new_password,
@@ -377,7 +430,7 @@ class TwoFAService:
             timeout=timeout,
             log=log,
         )
-        log("[done] Mật khẩu mới đã được xác minh thành công")
+        log("[THÀNH CÔNG] Đổi mật khẩu hoàn tất an toàn!")
         return RotationResult(
             secret=secret,
             login_verified=True,
@@ -397,7 +450,7 @@ class TwoFAService:
         log: LogFn,
     ) -> RotationResult:
         """Đổi password rồi đổi 2FA. Checkpoint sau mỗi bước."""
-        log("[1/4] Đang đăng nhập với thông tin hiện tại...")
+        log("[1/4] 🔑 Đang đăng nhập với thông tin hiện tại...")
         session = await self._login(
             email=email,
             password=password,
@@ -411,7 +464,7 @@ class TwoFAService:
             log=log,
         )
 
-        log("[2/4] Đang tạo và đổi mật khẩu mới...")
+        log("[2/4] 🔐 Đang tạo và đổi mật khẩu mới...")
         new_password = self._generate_new_password(password)
         change_fn = self._change_password_fn or self._resolve_password_fn()
         try:
@@ -429,15 +482,15 @@ class TwoFAService:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            detail = str(exc).strip() or type(exc).__name__
-            raise TwoFAFlowError(f"Đổi mật khẩu thất bại: {detail[:220]}") from exc
+            detail = self._clean_error_message(exc)
+            raise TwoFAFlowError(f"Đổi mật khẩu thất bại: {detail}", error_kind="technical_error") from exc
 
         # Checkpoint password mới, secret chưa đổi
         await checkpoint(new_password, old_secret)
-        log("[checkpoint] Mật khẩu mới đã được lưu — bắt đầu đổi 2FA")
+        log(f"   ↳ [Safe-Lock] Mật khẩu mới đã được lưu an toàn: {new_password}")
 
         # Đăng nhập lại với password mới để lấy session mới
-        log("[3/4] Đăng nhập lại với mật khẩu mới để đổi 2FA...")
+        log("[3/4] 🔄 Đang đổi mã 2FA an toàn (Safe-Lock)...")
         session2 = await self._login(
             email=email,
             password=new_password,
@@ -447,34 +500,49 @@ class TwoFAService:
         )
         access_token = str(session2["accessToken"])
 
-        log("[3/4] Đang thay thế khóa TOTP...")
         _, default_rotate = self._resolve_dependencies()
         rotate_fn = self._rotate_fn or default_rotate
+
+        async def _early_checkpoint_pwd(data: dict[str, Any]) -> None:
+            sec = str(data.get("secret") or "").strip()
+            if sec:
+                await checkpoint(new_password, sec)
+                masked = f"{sec[:6]}...{sec[-4:]}" if len(sec) > 10 else sec
+                log(f"   ↳ [Safe-Lock] Password và Secret mới đã được lưu an toàn ({masked})")
+
         try:
+            rotate_timeout = max(timeout, 60.0)
             payload = await asyncio.wait_for(
                 rotate_fn(
                     access_token=access_token,
                     cookies=session2.get("__cookies"),
                     proxy=None,
+                    on_enroll=_early_checkpoint_pwd,
                     log=log,
                 ),
-                timeout=timeout,
+                timeout=rotate_timeout,
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            detail = str(exc).strip() or type(exc).__name__
-            raise TwoFAFlowError(f"Đổi 2FA thất bại: {detail[:220]}") from exc
+            partial = getattr(exc, "partial_state", None)
+            if isinstance(partial, dict) and partial.get("secret"):
+                try:
+                    await checkpoint(new_password, str(partial["secret"]))
+                    log("   ↳ [Cứu hộ Safe-Lock] Đã lưu emergency password + secret vào hệ thống!")
+                except Exception:
+                    pass
+            detail = self._clean_error_message(exc)
+            raise TwoFAFlowError(f"Đổi 2FA thất bại: {detail}", error_kind="technical_error") from exc
 
         new_secret = str(payload.get("secret") or "").strip()
         if payload.get("activated") is not True or not new_secret:
-            raise TwoFAFlowError("Secret mới chưa được kích hoạt")
+            raise TwoFAFlowError("Secret mới chưa được kích hoạt thành công trên OpenAI", error_kind="technical_error")
 
         # Checkpoint cả password mới + secret mới
         await checkpoint(new_password, new_secret)
-        log("[checkpoint] Password + Secret mới đã được lưu an toàn")
 
-        log("[4/4] Đang xác minh với password + 2FA mới...")
+        log("[4/4] 🛡️ Xác minh đăng nhập với password và 2FA mới...")
         await self.verify(
             email=email,
             password=new_password,
@@ -482,7 +550,7 @@ class TwoFAService:
             timeout=timeout,
             log=log,
         )
-        log("[done] Password và 2FA mới đã được xác minh thành công")
+        log(f"[THÀNH CÔNG] Đổi mật khẩu và 2FA hoàn tất an toàn! Khóa mới: {new_secret}")
         return RotationResult(
             secret=new_secret,
             login_verified=True,

@@ -1056,6 +1056,20 @@ NON_RETRYABLE_LOGIN_PATTERNS: tuple[str, ...] = (
     "yêu cầu 2fa nhưng không có",
     "otp polling returned empty",
     "passwordless otp login but no mail_provider",
+    "invalid_password",
+    "invalid_credential",
+    "invalid password",
+    "wrong password",
+    "sai mật khẩu",
+    "2fa_failed",
+    "mã 2fa (otp) không đúng",
+    "incorrect_code",
+    "secret 2fa không hợp lệ",
+    "push_auth_required",
+    "account restricted",
+    "account locked",
+    "account suspended",
+    "account banned",
 )
 
 # Password endpoint có thể trả 409 khi OAuth/login state hết hiệu lực.
@@ -2335,6 +2349,35 @@ def _cookie_value_for_domains(
     return candidates[0][2] if len(candidates) == 1 else None
 
 
+def _is_cloudflare_challenge(resp: Any) -> bool:
+    """Detect Cloudflare challenge or mitigation block on response."""
+    if resp is None:
+        return False
+    try:
+        headers = getattr(resp, "headers", {}) or {}
+        cf_mitigated = headers.get("cf-mitigated", "")
+        if str(cf_mitigated).strip().casefold() == "challenge":
+            return True
+        status = getattr(resp, "status_code", 0)
+        text = str(getattr(resp, "text", "") or "")[:4096].casefold()
+        markers = (
+            "cf-chl",
+            "/cdn-cgi/challenge",
+            "challenge-platform",
+            "just a moment",
+            "<title>access denied",
+            "<title>blocked",
+            "attention required",
+        )
+        if any(m in text for m in markers):
+            return True
+        if status in (403, 503) and ("cloudflare" in text or "cf-ray" in headers):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 async def get_session_pure_request(
     *,
     email: str,
@@ -2359,6 +2402,66 @@ async def get_session_pure_request(
       8. Consume callback → session_token
       9. GET /api/auth/session → full JSON
     """
+    flow_mode = _resolve_login_flow(login_flow)
+    log(f"[session-req] login_flow={flow_mode}")
+
+    # Primary pure request flow via Chrome 142 macOS profile + pure Sentinel PoW (Tool yunxi / 2026-09 standard)
+    if password:
+        import logging
+        from chatgpt_auth import create_async_client, login_pure_request_with_payload
+        from chatgpt_auth.errors import LoginError
+
+        _auth_logger = logging.getLogger("session_phase.chatgpt_login")
+        client = create_async_client(proxy=proxy, timeout=30.0)
+        try:
+            bundle, session_payload = await login_pure_request_with_payload(
+                email=email,
+                password=password,
+                totp_secret=secret,
+                http_client=client,
+                logger=_auth_logger,
+                log_fn=log,
+            )
+            session_data = dict(session_payload)
+            session_data["accessToken"] = bundle.access_token
+            session_data["access_token"] = bundle.access_token
+            cookies_export: list[dict[str, Any]] = []
+            try:
+                for ck in client.cookies.jar:
+                    cookies_export.append({
+                        "name": ck.name,
+                        "value": ck.value,
+                        "domain": ck.domain,
+                        "path": ck.path or "/",
+                        "secure": bool(ck.secure),
+                        "httpOnly": ck.name.startswith("__Host-") or ck.name.startswith("__Secure-"),
+                        "sameSite": "Lax",
+                        "expires": ck.expires if ck.expires else -1,
+                    })
+            except Exception:
+                pass
+            session_data["__cookies"] = cookies_export
+            return session_data
+        except LoginError as exc:
+            reason = getattr(exc, "reason", "login_failed")
+            msg = getattr(exc, "message", None) or str(exc)
+            if reason == "account_locked" or "deactivated" in msg.lower():
+                raise SessionError(f"account deactivated: {msg}") from exc
+            if reason == "invalid_credential":
+                raise SessionError(f"invalid_password: {msg}") from exc
+            if reason == "push_auth_required":
+                raise SessionError("push_auth_required: thiết bị yêu cầu phê duyệt đăng nhập (Push Auth)") from exc
+            if reason == "mfa_required":
+                raise SessionError(f"2fa_failed: {msg}") from exc
+            if "cloudflare" in msg.lower() or (exc.diagnostic and exc.diagnostic.get("cf_mitigated")):
+                raise SessionError(f"Cloudflare challenge detected (HTTP 403): {msg}") from exc
+            raise SessionError(f"login failed: {msg}") from exc
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                pass
+
     from request_phase import (
         _create_session,
         _step_csrf,
@@ -2412,8 +2515,8 @@ async def get_session_pure_request(
         # `use_login_hint=False` → state machine ở mức "đợi email submission",
         # cần authorize/continue để rẽ flow (slow path / fallback).
         # ─────────────────────────────────────────────────────────────
-        def _do_bootstrap(*, use_login_hint: bool) -> tuple[Any, str, str, str]:
-            """Returns (session, device_id, auth_url, landing_url).
+        def _do_bootstrap(*, use_login_hint: bool) -> tuple[Any, str, str, str, str]:
+            """Returns (session, device_id, session_id, auth_url, landing_url).
 
             Có TLS fingerprint rotation. Raise nếu bootstrap fail trên mọi
             impersonate candidate.
@@ -2424,60 +2527,51 @@ async def get_session_pure_request(
                 try:
                     if idx > 0:
                         log(f"[session-req] TLS rotation: retrying with impersonate={imp}")
-                    did = str(__import__('uuid').uuid4())
+                    did = str(uuid.uuid4())
+                    sid = str(uuid.uuid4())
                     if flow_mode == "anti409":
-                        # ── Anti-detection (flow dev) ──────────────────────────
-                        # Pre-set oai-did + warm chatgpt.com + signin/openai kèm
-                        # auth_session_logging_id → server thấy device_id/auth
-                        # session consistent ngay từ đầu, tránh /password/verify
-                        # reject "invalid_state". Xem journal 260617-1755.
-                        from urllib.parse import urlencode as _urlencode
+                        # ── Anti-detection & Anti-403 (chatgpt-login-flow-porting-guide) ──
+                        # 1. Seed oai-did cookie on .chatgpt.com /
                         try:
-                            sess.cookies.set("oai-did", did, domain="chatgpt.com")
+                            sess.cookies.set("oai-did", did, domain=".chatgpt.com", path="/")
                         except Exception:
-                            pass
-                        _warm_ua_headers = {
+                            try:
+                                sess.cookies.set("oai-did", did, domain="chatgpt.com")
+                            except Exception:
+                                pass
+
+                        # 2. Prime navigation GET https://chatgpt.com/ (clean, no ad-hoc backend-anon calls)
+                        # NOTE: warming chatgpt: backend-anon/accounts/check (deprecated — real browsers don't hit this pre-login)
+                        prime_headers = {
                             "User-Agent": USER_AGENT,
                             "sec-ch-ua": _SEC_CH_UA,
                             "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
                             "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
                             "Accept-Language": "en-US,en;q=0.9",
+                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                            "Sec-Fetch-Site": "none",
+                            "Sec-Fetch-Mode": "navigate",
+                            "Sec-Fetch-User": "?1",
+                            "Sec-Fetch-Dest": "document",
+                            "Upgrade-Insecure-Requests": "1",
+                            "oai-device-id": did,
                         }
                         try:
-                            sess.get(
+                            prime_resp = sess.get(
                                 "https://chatgpt.com/",
-                                headers={
-                                    **_warm_ua_headers,
-                                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                                    "Sec-Fetch-Mode": "navigate",
-                                    "Sec-Fetch-Dest": "document",
-                                    "Upgrade-Insecure-Requests": "1",
-                                },
+                                headers=prime_headers,
                                 timeout=20,
                                 allow_redirects=True,
                             )
-                            sess.get(
-                                "https://chatgpt.com/backend-anon/accounts/check/v4-2023-04-27",
-                                params={"timezone_offset_min": -420},
-                                headers={
-                                    **_warm_ua_headers,
-                                    "Accept": "*/*",
-                                    "Referer": "https://chatgpt.com/",
-                                    "oai-device-id": did,
-                                },
-                                timeout=20,
-                            )
-                            sess.get(
-                                "https://chatgpt.com/api/auth/providers",
-                                headers={
-                                    **_warm_ua_headers,
-                                    "Accept": "*/*",
-                                    "Referer": "https://chatgpt.com/",
-                                },
-                                timeout=20,
-                            )
-                        except Exception as _w_exc:
-                            log(f"[session-req] warming non-fatal: {_w_exc}")
+                            if _is_cloudflare_challenge(prime_resp):
+                                raise SessionError(
+                                    f"Cloudflare challenge detected at prime (HTTP {prime_resp.status_code})"
+                                )
+                        except SessionError:
+                            raise
+                        except Exception as _p_exc:
+                            log(f"[session-req] prime non-fatal: {_p_exc}")
+
                         # Server có thể re-issue oai-did sau warming → đọc lại làm
                         # device_id chuẩn (cookie ↔ ext-oai-did query phải MATCH).
                         did = _cookie_value_for_domains(
@@ -2486,18 +2580,60 @@ async def get_session_pure_request(
                             "chatgpt.com",
                             "openai.com",
                         ) or did
-                        csrf = _step_csrf(sess, log)
+
+                        # 3. CSRF with unified device_id and session_id
+                        csrf_headers = {
+                            "User-Agent": USER_AGENT,
+                            "sec-ch-ua": _SEC_CH_UA,
+                            "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
+                            "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
+                            "Accept-Language": "en-US,en;q=0.9",
+                            "Accept": "application/json",
+                            "Origin": "https://chatgpt.com",
+                            "Referer": "https://chatgpt.com/",
+                            "oai-device-id": did,
+                            "oai-session-id": sid,
+                        }
+                        csrf_resp = sess.get(
+                            "https://chatgpt.com/api/auth/csrf",
+                            headers=csrf_headers,
+                            timeout=20,
+                        )
+                        if _is_cloudflare_challenge(csrf_resp):
+                            raise SessionError(
+                                f"Cloudflare challenge detected at csrf (HTTP {csrf_resp.status_code})"
+                            )
+                        if csrf_resp.status_code != 200:
+                            raise SessionError(f"csrf fetch failed: HTTP {csrf_resp.status_code}")
+                        csrf_json = csrf_resp.json() or {}
+                        csrf = str(csrf_json.get("csrfToken") or "").strip()
+                        if not csrf:
+                            raise SessionError("csrfToken empty or missing in response")
+
+                        # 4. Signin POST https://chatgpt.com/api/auth/signin/openai
+                        from urllib.parse import urlencode as _urlencode
                         _au_params = {
                             "prompt": "login",
-                            "ext-passkey-client-capabilities": "11111",
+                            "ext-passkey-client-capabilities": "01001",
                             "ext-oai-did": did,
-                            "auth_session_logging_id": str(__import__('uuid').uuid4()),
+                            "auth_session_logging_id": sid,
                             "screen_hint": "login_or_signup",
                         }
                         if use_login_hint:
                             _au_params["login_hint"] = email
-                        _au_headers = _common_headers("https://chatgpt.com/auth/login")
-                        _au_headers["Content-Type"] = "application/x-www-form-urlencoded"
+                        _au_headers = {
+                            "User-Agent": USER_AGENT,
+                            "sec-ch-ua": _SEC_CH_UA,
+                            "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
+                            "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
+                            "Accept-Language": "en-US,en;q=0.9",
+                            "Accept": "application/json",
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "Origin": "https://chatgpt.com",
+                            "Referer": "https://chatgpt.com/",
+                            "oai-device-id": did,
+                            "oai-session-id": sid,
+                        }
                         _au_resp = sess.post(
                             "https://chatgpt.com/api/auth/signin/openai?" + _urlencode(_au_params),
                             headers=_au_headers,
@@ -2508,11 +2644,18 @@ async def get_session_pure_request(
                             },
                             timeout=30,
                         )
+                        if _is_cloudflare_challenge(_au_resp):
+                            raise SessionError(
+                                f"Cloudflare challenge detected at signin (HTTP {_au_resp.status_code})"
+                            )
                         if _au_resp.status_code != 200:
                             raise SessionError(f"signin/openai failed: HTTP {_au_resp.status_code}")
                         au = (_au_resp.json() or {}).get("url", "")
                         if not au:
                             raise SessionError("signin/openai: no URL in response")
+                        parsed_au = urlparse(au)
+                        if parsed_au.scheme.lower() != "https" or (parsed_au.hostname or "").lower() != "auth.openai.com":
+                            raise SessionError(f"signin/openai returned non-auth domain: {au[:100]}")
                         log(f"[session-req] auth URL: {au[:80]}...")
                     else:
                         # ── Legacy flow main: dùng _step_auth_url helper ──────
@@ -2530,7 +2673,7 @@ async def get_session_pure_request(
                     r = sess.get(
                         au,
                         headers={
-                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
                             "Accept-Language": "en-US,en;q=0.9",
                             "Accept-Encoding": "gzip, deflate, br, zstd",
                             "Referer": "https://chatgpt.com/",
@@ -2544,10 +2687,13 @@ async def get_session_pure_request(
                             "sec-ch-ua": _SEC_CH_UA,
                             "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
                             "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
+                            "oai-device-id": did,
                         },
                         timeout=30,
                         allow_redirects=True,
                     )
+                    if _is_cloudflare_challenge(r):
+                        raise SessionError(f"Cloudflare challenge detected at authorize (HTTP {r.status_code})")
                     land = str(getattr(r, "url", "") or au)
                     did = _cookie_value_for_domains(
                         sess.cookies,
@@ -2555,7 +2701,7 @@ async def get_session_pure_request(
                         "openai.com",
                         "chatgpt.com",
                     ) or did
-                    return sess, did, au, land
+                    return sess, did, sid, au, land
                 except Exception as e:
                     last_exc = e
                     try:
@@ -2583,7 +2729,7 @@ async def get_session_pure_request(
                 if isinstance(last_exc, RequestPhaseError):
                     raise SessionError(f"bootstrap failed: {last_exc}") from last_exc
                 raise last_exc
-            raise SessionError("bootstrap failed (no auth_url)")
+            raise SessionError("bootstrap failed: all impersonate candidates exhausted")
 
         def _detect_flow_from_landing(land_url: str) -> str:
             """Map landing URL → 'password' | 'otp' | '' (undetermined)."""
@@ -2599,71 +2745,60 @@ async def get_session_pure_request(
                 return "password"
             return ""
 
-        # ─────────────────────────────────────────────────────────────
-        # Fast path: bootstrap WITH login_hint. Nếu account tồn tại + có
-        # password, server thường redirect thẳng tới /log-in/password →
-        # skip authorize/continue (tránh bug HTTP 409 invalid_state khi
-        # state machine đã pre-set bởi login_hint).
-        # ─────────────────────────────────────────────────────────────
-        session, device_id, auth_url, landing = _do_bootstrap(use_login_hint=True)
+        # Fast path: bootstrap WITH login_hint
+        session, device_id, session_id, auth_url, landing = _do_bootstrap(use_login_hint=True)
         log(f"[session-req] landing: {landing[:90]!r}")
 
         page_type = ""
         continue_url = ""
         flow = _detect_flow_from_landing(landing)
 
-        # ─────────────────────────────────────────────────────────────
         # Fallback: landing không xác định → re-bootstrap KHÔNG login_hint
-        # để state machine ở "đợi email submission", rồi gọi authorize/continue
-        # clean. Đây là lý do bug "invalid_state HTTP 409" — gọi
-        # authorize/continue với email khi server đã pre-set login_hint sẽ
-        # bị reject vì state đã ở step sau.
-        # ─────────────────────────────────────────────────────────────
         if not flow:
             log("[session-req] landing không xác định — re-bootstrap KHÔNG login_hint để gọi authorize/continue clean...")
             try:
                 session.close()
             except Exception:
                 pass
-            session, device_id, auth_url, landing = _do_bootstrap(use_login_hint=False)
+            session, device_id, session_id, auth_url, landing = _do_bootstrap(use_login_hint=False)
             log(f"[session-req] retry landing: {landing[:90]!r}")
             flow = _detect_flow_from_landing(landing)
 
-            if not flow:
-                # State machine giờ clean (no login_hint preset) → authorize/continue
-                # an toàn để drive flow. Vẫn catch 409 invalid_state để báo lỗi rõ.
-                log("[session-req] resolve qua authorize/continue (no login_hint)...")
-                ac_sentinel = _get_sentinel_token(session, device_id, "login", log)
-                try:
-                    ac_data = _step_authorize_continue(
-                        session, email, ac_sentinel,
-                        screen_hint="login",
-                        referer="https://auth.openai.com/log-in",
-                        device_id=device_id,
-                        log=log,
-                    )
-                except RequestPhaseError as exc:
-                    msg = str(exc)
-                    if "HTTP 409" in msg and "invalid_state" in msg:
-                        raise SessionError(
-                            "authorize/continue bị OpenAI từ chối với HTTP 409 invalid_state. "
-                            "State machine không đồng bộ — có thể do proxy chậm khiến state hết hạn "
-                            "hoặc account đang ở flow đặc biệt (passwordless/blocked). "
-                            f"Detail: {msg}"
-                        ) from exc
-                    raise SessionError(f"authorize/continue failed: {msg}") from exc
-                ac_page = ac_data.get("page", {}) if isinstance(ac_data, dict) else {}
-                page_type = (ac_page.get("type") or "").strip()
-                continue_url = (ac_data.get("continue_url") or "").strip()
-                log(f"[session-req] authorize/continue → page_type={page_type!r} continue_url={continue_url[:80]!r}")
-                if page_type == "login_password" or "/log-in/password" in continue_url:
-                    flow = "password"
-                elif page_type in ("email_otp_verification", "email_verification") or "/email-verification" in continue_url:
-                    flow = "otp"
-                else:
+        if not flow:
+            # State machine giờ clean (no login_hint preset) → authorize/continue
+            # an toàn để drive flow. Vẫn catch 409 invalid_state để báo lỗi rõ.
+            log("[session-req] resolve qua authorize/continue (no login_hint)...")
+            ac_sentinel = _get_sentinel_token(session, device_id, "login", log)
+            try:
+                ac_data = _step_authorize_continue(
+                    session, email, ac_sentinel,
+                    screen_hint="login",
+                    referer="https://auth.openai.com/log-in",
+                    device_id=device_id,
+                    log=log,
+                )
+            except RequestPhaseError as exc:
+                msg = str(exc)
+                if "HTTP 409" in msg and "invalid_state" in msg:
                     raise SessionError(
-                        f"unexpected login state: page_type={page_type!r} landing={landing[:80]!r}"
-                    )
+                        "authorize/continue bị OpenAI từ chối với HTTP 409 invalid_state. "
+                        "State machine không đồng bộ — có thể do proxy chậm khiến state hết hạn "
+                        "hoặc account đang ở flow đặc biệt (passwordless/blocked). "
+                        f"Detail: {msg}"
+                    ) from exc
+                raise SessionError(f"authorize/continue failed: {msg}") from exc
+            ac_page = ac_data.get("page", {}) if isinstance(ac_data, dict) else {}
+            page_type = (ac_page.get("type") or "").strip()
+            continue_url = (ac_data.get("continue_url") or "").strip()
+            log(f"[session-req] authorize/continue → page_type={page_type!r} continue_url={continue_url[:80]!r}")
+            if page_type == "login_password" or "/log-in/password" in continue_url:
+                flow = "password"
+            elif page_type in ("email_otp_verification", "email_verification") or "/email-verification" in continue_url:
+                flow = "otp"
+            else:
+                raise SessionError(
+                    f"unexpected login state: page_type={page_type!r} landing={landing[:80]!r}"
+                )
 
         try:
 
@@ -2706,6 +2841,10 @@ async def get_session_pure_request(
                     json={"password": password},
                     timeout=30,
                 )
+                if _is_cloudflare_challenge(resp):
+                    raise SessionError(
+                        f"Cloudflare challenge detected at password/verify (HTTP {resp.status_code})"
+                    )
                 if resp.status_code != 200:
                     full_body = resp.text or ""
                     if classify_account_check_error(full_body) == "deactivated":
@@ -2719,6 +2858,9 @@ async def get_session_pure_request(
                 page_type = ((pw_data.get("page") or {}).get("type") or "").strip()
                 continue_url = (pw_data.get("continue_url") or "").strip()
                 log(f"[session-req] post-password → page_type={page_type!r} continue_url={continue_url[:80]!r}")
+
+                if page_type == "push_auth_verification" or "/push-auth-verification" in (continue_url or ""):
+                    raise SessionError("push_auth_required: thiết bị yêu cầu phê duyệt đăng nhập (device approval)")
 
             # ── Branch B: passwordless OTP login ──
             elif flow == "otp":
@@ -2782,19 +2924,36 @@ async def get_session_pure_request(
                     json={"id": challenge_id, "type": "totp", "force_fresh_challenge": False},
                     timeout=30,
                 )
+                if _is_cloudflare_challenge(resp):
+                    raise SessionError(
+                        f"Cloudflare challenge detected at mfa/issue_challenge (HTTP {resp.status_code})"
+                    )
                 if resp.status_code != 200:
                     log(f"[session-req] issue_challenge returned {resp.status_code}: {(resp.text or '')[:200]}")
                     # Non-fatal: some accounts may not need issue_challenge
 
-                # Step 6b: Verify TOTP
-                code = _generate_totp(secret)
-                log("[session-req] verifying TOTP...")
+                # Step 6b: Dedicated Sentinel Token for mfa_verify (Section 7)
+                log("[session-req] acquiring fresh Sentinel token for mfa_verify...")
+                sentinel_mfa = _get_sentinel_token(session, device_id, "mfa_verify", log)
+
+                # Step 6c: Fresh TOTP code right before verify
+                import pyotp
+                fresh_totp = pyotp.TOTP(secret).now()
+                log(f"[session-req] verifying TOTP code: {fresh_totp[:2]}****...")
+                mfa_verify_headers = dict(mfa_headers)
+                if sentinel_mfa:
+                    mfa_verify_headers["openai-sentinel-token"] = sentinel_mfa
+
                 resp = session.post(
                     "https://auth.openai.com/api/accounts/mfa/verify",
-                    headers=mfa_headers,
-                    json={"id": challenge_id, "type": "totp", "code": code},
+                    headers=mfa_verify_headers,
+                    json={"id": challenge_id, "type": "totp", "code": fresh_totp},
                     timeout=30,
                 )
+                if _is_cloudflare_challenge(resp):
+                    raise SessionError(
+                        f"Cloudflare challenge detected at mfa/verify (HTTP {resp.status_code})"
+                    )
                 if resp.status_code != 200:
                     full_body = resp.text or ""
                     if classify_account_check_error(full_body) == "deactivated":
@@ -2815,7 +2974,7 @@ async def get_session_pure_request(
             # ── Helpers cho callback consume + verify session cookie ──
             # `_consume_callback` của request_phase trả bool (cookie đã set chưa)
             # nhưng caller cũ ignore → khi cookie chưa set kịp do server chậm /
-                # callback code đã expire, /api/auth/session sẽ trả response chỉ
+            # callback code đã expire, /api/auth/session sẽ trả response chỉ
             # chứa WARNING_BANNER (unauthenticated). Retry + verify rõ ràng.
             def _has_session_cookie() -> bool:
                 """NextAuth session-token có thể bị split thành .0/.1 khi quá dài."""
@@ -2854,14 +3013,59 @@ async def get_session_pure_request(
             if continue_url and "auth.openai.com" in continue_url and "code=" not in continue_url:
                 log("[session-req] continue_url is auth page, attempting reauthorize for callback...")
                 try:
-                    csrf2 = _step_csrf(session, log)
-                    auth_url2 = _step_auth_url(session, csrf2, log)
-                    # Follow authorize URL (should redirect to callback since we're now authenticated)
-                    callback_url, _ = _step_follow_redirects(session, auth_url2, log)
-                    if callback_url:
-                        _consume_callback_verified(callback_url)
+                    csrf_reauth_headers = _common_headers("https://chatgpt.com/")
+                    if device_id:
+                        csrf_reauth_headers["oai-device-id"] = device_id
+                    if session_id:
+                        csrf_reauth_headers["oai-session-id"] = session_id
+                    csrf_resp = session.get(
+                        "https://chatgpt.com/api/auth/csrf",
+                        headers=csrf_reauth_headers,
+                        timeout=20,
+                    )
+                    csrf2 = str((csrf_resp.json() or {}).get("csrfToken") or "").strip()
+                    if csrf2:
+                        from urllib.parse import urlencode as _urlencode
+                        _reauth_params = {
+                            "prompt": "login",
+                            "ext-passkey-client-capabilities": "01001",
+                            "ext-oai-did": device_id,
+                            "auth_session_logging_id": session_id,
+                            "screen_hint": "login_or_signup",
+                        }
+                        _reauth_headers = {
+                            "User-Agent": USER_AGENT,
+                            "sec-ch-ua": _SEC_CH_UA,
+                            "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
+                            "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
+                            "Accept-Language": "en-US,en;q=0.9",
+                            "Accept": "application/json",
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "Origin": "https://chatgpt.com",
+                            "Referer": "https://chatgpt.com/",
+                            "oai-device-id": device_id,
+                            "oai-session-id": session_id,
+                        }
+                        _reauth_resp = session.post(
+                            "https://chatgpt.com/api/auth/signin/openai?" + _urlencode(_reauth_params),
+                            headers=_reauth_headers,
+                            data={
+                                "csrfToken": csrf2,
+                                "callbackUrl": "https://chatgpt.com/",
+                                "json": "true",
+                            },
+                            timeout=30,
+                        )
+                        auth_url2 = str((_reauth_resp.json() or {}).get("url") or "").strip()
                     else:
-                        log("[session-req] reauthorize: callback URL KHÔNG tìm thấy trong redirect chain")
+                        auth_url2 = _step_auth_url(session, csrf2, log)
+                    # Follow authorize URL (should redirect to callback since we're now authenticated)
+                    if auth_url2:
+                        callback_url, _ = _step_follow_redirects(session, auth_url2, log)
+                        if callback_url:
+                            _consume_callback_verified(callback_url)
+                        else:
+                            log("[session-req] reauthorize: callback URL KHÔNG tìm thấy trong redirect chain")
                 except Exception as e:
                     log(f"[session-req] reauthorize attempt failed: {e}")
 
@@ -2930,12 +3134,20 @@ async def get_session_pure_request(
             # Step 9: Get FULL /api/auth/session JSON (same as browser mode)
             _t_sess = time.monotonic()
             sess_headers = _common_headers("https://chatgpt.com/")
+            if device_id:
+                sess_headers["oai-device-id"] = device_id
+            if session_id:
+                sess_headers["oai-session-id"] = session_id
             sess_resp = session.get(
                 "https://chatgpt.com/api/auth/session",
                 headers=sess_headers,
                 timeout=30,
             )
             log(f"[session-req] GET /api/auth/session {time.monotonic() - _t_sess:.2f}s")
+            if _is_cloudflare_challenge(sess_resp):
+                raise SessionError(
+                    f"Cloudflare challenge detected at /api/auth/session (HTTP {sess_resp.status_code})"
+                )
             if sess_resp.status_code != 200:
                 full_body = sess_resp.text or ""
                 if classify_account_check_error(full_body) == "deactivated":
@@ -2951,7 +3163,12 @@ async def get_session_pure_request(
             if classify_account_check_error(str(session_data)) == "deactivated":
                 raise SessionError("account deactivated")
 
-            if not isinstance(session_data, dict) or not session_data.get("accessToken"):
+            raw_token = (
+                session_data.get("accessToken")
+                or (session_data.get("user") or {}).get("accessToken")
+                or (session_data.get("user") or {}).get("access_token")
+            )
+            if not isinstance(raw_token, str) or not raw_token.strip():
                 # Detect "warning-only" response: server trả banner cảnh báo
                 # nhưng KHÔNG có session payload → user vẫn unauthenticated.
                 keys = sorted(session_data.keys()) if isinstance(session_data, dict) else []
@@ -2972,7 +3189,7 @@ async def get_session_pure_request(
                 raise SessionError(
                     f"login completed but /api/auth/session has no accessToken: {str(session_data)[:200]}"
                 )
-
+            session_data["accessToken"] = raw_token.strip()
             user_email = (session_data.get("user", {}) or {}).get("email", "") or email
             log(f"[session-req] ✓ done — user: {user_email}")
             # Capture cookies cho hybrid flow (caller có thể inject vào browser).

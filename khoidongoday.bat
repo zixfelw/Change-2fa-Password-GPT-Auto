@@ -1,73 +1,73 @@
 @echo off
+title Tool change Password vs 2FA GPT - Infinity AI Store
 setlocal EnableExtensions
-set "APP_DIR=%~dp0"
-set "ROOT_DIR=%APP_DIR%"
-set "PYTHONW=%APP_DIR%.venv\Scripts\pythonw.exe"
+cd /d "%~dp0"
+set "APP_DIR=%CD%"
+set "PYTHON="
 
-REM Standalone release: setup is complete only after every dependency and
-REM pinned browser verification succeeds.
-if exist "%APP_DIR%.setup-complete" if exist "%PYTHONW%" goto runtime_ready
-
-REM Monorepo development layout: reuse the parent virtual environment only when
-REM core modules are not bundled beside this launcher.
-if not exist "%APP_DIR%_camoufox_runtime.py" if exist "%APP_DIR%..\.venv\Scripts\pythonw.exe" (
-  set "ROOT_DIR=%APP_DIR%.."
-  set "PYTHONW=%APP_DIR%..\.venv\Scripts\pythonw.exe"
-  goto runtime_ready
+:: 1. Uu tien .venv ngay trong thu muc hien tai
+if exist "%APP_DIR%\.venv\Scripts\python.exe" (
+    set "PYTHON=%APP_DIR%\.venv\Scripts\python.exe"
+    goto check_running
 )
 
-REM First standalone launch: install Python dependencies and browser runtime.
-if not exist "%APP_DIR%setup.bat" (
-  echo [Tool Password vs 2FA GPT] Khong tim thay setup.bat trong:
-  echo %APP_DIR%
-  pause
-  exit /b 1
-)
-call "%APP_DIR%setup.bat"
-if errorlevel 1 (
-  echo.
-  echo [Tool Password vs 2FA GPT] Setup that bai. Kiem tra loi phia tren roi thu lai.
-  pause
-  exit /b 1
-)
-set "ROOT_DIR=%APP_DIR%"
-set "PYTHONW=%APP_DIR%.venv\Scripts\pythonw.exe"
-if not exist "%PYTHONW%" (
-  echo [Tool Password vs 2FA GPT] Setup xong nhung khong tim thay pythonw.exe.
-  pause
-  exit /b 1
+:: 2. Neu khong co, dung .venv o thu muc cha (monorepo / dev)
+if exist "%APP_DIR%\..\.venv\Scripts\python.exe" (
+    set "PYTHON=%APP_DIR%\..\.venv\Scripts\python.exe"
+    goto check_running
 )
 
-:runtime_ready
-set "SOURCE_CA=%ROOT_DIR%\.venv\Lib\site-packages\certifi\cacert.pem"
-set "ASCII_CA_DIR=%LOCALAPPDATA%\InfinityAIStore\Change2FA"
-set "ASCII_CA=%ASCII_CA_DIR%\cacert.pem"
-
-if not exist "%SOURCE_CA%" (
-  echo [Tool Password vs 2FA GPT] Khong tim thay CA certificate:
-  echo %SOURCE_CA%
-  pause
-  exit /b 1
-)
-if not exist "%ASCII_CA_DIR%" mkdir "%ASCII_CA_DIR%"
-copy /Y "%SOURCE_CA%" "%ASCII_CA%" >nul
-if errorlevel 1 (
-  echo [Tool Password vs 2FA GPT] Khong the chuan bi CA certificate.
-  pause
-  exit /b 1
+:: 3. Neu chua co .venv nao, goi setup.bat de tao
+if exist "%APP_DIR%\setup.bat" (
+    echo [Tool Password vs 2FA GPT] Phat hien chua cai dat runtime. Dang chay setup...
+    call "%APP_DIR%\setup.bat"
+    if errorlevel 1 (
+        echo.
+        echo [ERROR] Cai dat that bai.
+        pause
+        exit /b 1
+    )
+    if exist "%APP_DIR%\.venv\Scripts\python.exe" (
+        set "PYTHON=%APP_DIR%\.venv\Scripts\python.exe"
+        goto check_running
+    )
 )
 
+echo [ERROR] Khong tim thay Python runtime (.venv).
+echo Vui long chay setup.bat truoc.
+pause
+exit /b 1
+
+:check_running
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
-set "CURL_CA_BUNDLE=%ASCII_CA%"
-set "SSL_CERT_FILE=%ASCII_CA%"
-set "REQUESTS_CA_BUNDLE=%ASCII_CA%"
 
-powershell -NoProfile -WindowStyle Hidden -Command ^
-  "$health='http://127.0.0.1:5033/api/health';" ^
-  "$alive=$false; try { $alive=(Invoke-RestMethod -Uri $health -TimeoutSec 1).ok } catch {};" ^
-  "if (-not $alive) { Start-Process -WindowStyle Hidden -FilePath '%PYTHONW%' -ArgumentList @('%APP_DIR%server.py','--host','127.0.0.1','--port','5033') -WorkingDirectory '%ROOT_DIR%' };" ^
-  "for ($i=0; $i -lt 720; $i++) { try { if ((Invoke-RestMethod -Uri $health -TimeoutSec 1).ok) { Start-Process 'http://127.0.0.1:5033'; exit 0 } } catch {}; Start-Sleep -Milliseconds 250 };" ^
-  "Add-Type -AssemblyName PresentationFramework; [System.Windows.MessageBox]::Show('Server khong phan hoi sau 3 phut. Lan dau co the can tai Camoufox browser — thu lai hoac kiem tra log.','Tool change Password vs 2FA GPT') | Out-Null; exit 1"
+echo ============================================================
+echo   Tool change Password vs 2FA GPT - Infinity AI Store
+echo ============================================================
+echo.
+
+:: Kiem tra neu server da dang chay san tren port 5033
+powershell -NoProfile -Command "try { $r = (Invoke-RestMethod -Uri 'http://127.0.0.1:5033/api/health' -TimeoutSec 1).ok; if ($r) { Start-Process 'http://127.0.0.1:5033'; exit 42 } } catch {}"
+if errorlevel 42 (
+    echo [OK] Server da dang chay san tai: http://127.0.0.1:5033
+    echo [OK] Da mo Dashboard tren trinh duyet!
+    echo.
+    echo Nhan phim bat ky de thoat cua so nay...
+    pause >nul
+    exit /b 0
+)
+
+echo   Dang khoi dong server tai: http://127.0.0.1:5033 ...
+echo   (Trinh duyet se tu dong mo len sau vai giay)
+echo.
+
+"%PYTHON%" server.py --host 127.0.0.1 --port 5033
+
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Server da dung hoac gap su co.
+    pause
+)
 
 endlocal

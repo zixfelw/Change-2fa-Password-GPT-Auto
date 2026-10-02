@@ -1,0 +1,30 @@
+# Minimal deps for Change 2FA Community source release.
+# Chỉ cần cho request-only login flow + local web UI.
+# Không cần Playwright/Camoufox/Nuitka.
+
+# --- Web framework ---
+fastapi>=0.115,<0.140
+uvicorn>=0.30,<0.50
+pydantic>=2.9,<3
+typing_extensions>=4.10
+
+# --- HTTP client ---
+curl_cffi==0.15.0
+httpx[socks]>=0.27,<1
+requests>=2.31
+urllib3>=2.0
+certifi
+PySocks>=1.7
+
+# --- TOTP ---
+pyotp>=2.9
+
+# --- Sentinel / PoW ---
+orjson>=3.10
+
+# --- User agent ---
+PyYAML>=6
+faker>=20
+
+# --- C-bindings (curl_cffi) ---
+cffi>=1.16

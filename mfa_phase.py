@@ -596,46 +596,55 @@ async def rotate_2fa(
     access_token: str,
     cookies: list[dict[str, Any]] | None = None,
     proxy: str | None = None,
+    on_enroll: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     log=print,
 ) -> dict[str, Any]:
-    """Disable the current native TOTP factor, then activate a new one."""
-    from user_agent_profile import (
-        CURL_IMPERSONATE_PRIMARY,
-        SEC_CH_UA,
-        SEC_CH_UA_MOBILE,
-        SEC_CH_UA_PLATFORM,
-        WINDOWS_USER_AGENT,
-    )
+    """Disable the current native TOTP factor, then activate a new one with Safe-Lock protection."""
+    from chatgpt_auth import create_async_client, profile_chatgpt_login_http_client
+    from totp_helper import generate_code, normalize_secret
 
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    base_headers = {
-        "User-Agent": WINDOWS_USER_AGENT,
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Origin": "https://chatgpt.com",
-        "Referer": "https://chatgpt.com/",
-        "sec-ch-ua": SEC_CH_UA,
-        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
-        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
-    }
-    auth_headers = {"Authorization": f"Bearer {access_token}"}
-    async with AsyncSession(
-        impersonate=CURL_IMPERSONATE_PRIMARY,
-        proxies=proxies,
-        headers=base_headers,
-    ) as session:
+    client = create_async_client(proxy=proxy, timeout=30.0)
+    session = profile_chatgpt_login_http_client(client)
+    try:
+        has_cf = False
         if cookies:
-            _inject_session_cookies(session, cookies, log=log)
+            for c in cookies:
+                try:
+                    name = c.get("name") or ""
+                    val = c.get("value") or ""
+                    domain = c.get("domain") or ".chatgpt.com"
+                    path = c.get("path") or "/"
+                    if name in ("__cf_bm", "cf_clearance"):
+                        has_cf = True
+                    session.cookies.set(name, val, domain=domain, path=path)
+                except Exception:
+                    pass
+
+        if not has_cf:
+            try:
+                await session.get("https://chatgpt.com/", timeout=15)
+            except Exception as e:
+                log(f"[mfa-rotate] prime non-fatal: {e}")
+
+        auth_headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "*/*",
+            "Referer": "https://chatgpt.com/",
+            "Origin": "https://chatgpt.com",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+        }
+
+        # Step 1: GET mfa_info
+        log("   ↳ Kiểm tra cấu hình bảo mật 2FA hiện tại...")
         info_response = await session.get(
             f"{_BASE}/accounts/mfa_info",
             headers=auth_headers,
             timeout=_HTTP_TIMEOUT,
         )
         if info_response.status_code != 200:
-            raise MfaError(f"mfa_info failed HTTP {info_response.status_code}")
+            raise MfaError(f"mfa_info failed HTTP {info_response.status_code}: {info_response.text[:200]}")
         try:
             mfa_info = info_response.json()
         except Exception as exc:
@@ -643,10 +652,17 @@ async def rotate_2fa(
         if not isinstance(mfa_info, dict):
             raise MfaError("mfa_info returned a non-object payload")
 
-        if mfa_info.get("mfa_enabled_v2") is True:
-            factor_id = _select_totp_factor_id(mfa_info)
-            if factor_id is None:
-                raise MfaError("active TOTP factor id is unavailable")
+        # Step 2: Disable old TOTP if present
+        factor_id = None
+        for f in (mfa_info.get("factors") or {}).get("totp") or []:
+            if f.get("id"):
+                factor_id = f["id"]
+                break
+        if not factor_id:
+            factor_id = mfa_info.get("native_default_factor_id")
+
+        if factor_id and mfa_info.get("mfa_enabled_v2") is True:
+            log("   ↳ Đang tắt khóa 2FA cũ trên tài khoản...")
             disable_headers = {
                 **auth_headers,
                 "Content-Type": "application/json",
@@ -663,20 +679,148 @@ async def rotate_2fa(
                 raise MfaError(
                     f"disable old 2FA failed HTTP {disable_response.status_code}"
                 )
-            log("[mfa-rotate] old TOTP factor disabled")
+            log("   ↳ [Safe-Lock] Đã tắt 2FA cũ an toàn. Bắt đầu phiên cấp khóa mới...")
         else:
-            log("[mfa-rotate] old TOTP already disabled")
+            log("   ↳ 2FA cũ chưa bật hoặc đã tắt trước đó — Tiếp tục cấp khóa mới...")
 
-    result = await enable_2fa(
-        access_token=access_token,
-        cookies=cookies,
-        proxy=proxy,
-        log=log,
-    )
-    if result.get("activated") is not True or not result.get("secret"):
-        raise MfaError("new TOTP enrollment was not activated")
-    log("[mfa-rotate] new TOTP factor activated")
-    return result
+        # Step 3: Enroll new TOTP with Aggressive Resilient Retry
+        log("   ↳ Đang khởi tạo khóa 2FA (TOTP) mới...")
+        enroll_headers = {
+            **auth_headers,
+            "Content-Type": "application/json",
+        }
+        enroll_data = None
+        max_enroll_retries = 8
+        for attempt in range(1, max_enroll_retries + 1):
+            try:
+                enroll_response = await session.post(
+                    f"{_BASE}/accounts/mfa/enroll",
+                    headers=enroll_headers,
+                    data=json.dumps({"factor_type": "totp"}),
+                    timeout=_HTTP_TIMEOUT,
+                )
+                if enroll_response.status_code == 200:
+                    try:
+                        enroll_data = enroll_response.json()
+                        if enroll_data and "secret" in enroll_data:
+                            break
+                    except Exception:
+                        pass
+                elif enroll_response.status_code == 401 and cookies:
+                    log(f"   ↳ [Safe-Lock] Token hết hạn (lần {attempt}/{max_enroll_retries}) -> đang làm mới token...")
+                    new_token = await _refresh_access_token(session, cookies=cookies, log=log)
+                    if new_token:
+                        access_token = new_token
+                        auth_headers["Authorization"] = f"Bearer {access_token}"
+                        enroll_headers["Authorization"] = f"Bearer {access_token}"
+                else:
+                    log(f"   ⚠️ [Thử lại {attempt}/{max_enroll_retries}] Khởi tạo 2FA HTTP {enroll_response.status_code}")
+            except Exception as exc:
+                log(f"   ⚠️ [Thử lại {attempt}/{max_enroll_retries}] Lỗi kết nối khởi tạo: {exc}")
+
+            if attempt < max_enroll_retries:
+                backoff = min(1.5 * attempt, 6.0)
+                await asyncio.sleep(backoff)
+
+        if not enroll_data or "secret" not in enroll_data:
+            err_msg = (
+                "BÁO ĐỘNG ĐỎ: 2FA cũ đã tắt nhưng enroll 2FA mới thất bại sau các lần thử lại! "
+                "Tài khoản hiện CHỈ CÒN MẬT KHẨU (không có 2FA). Giữ nguyên IP để đăng nhập hoặc bật lại."
+            )
+            log(f"   ❌ [CRITICAL] {err_msg}")
+            raise MfaError(err_msg, partial_state={"is_old_disabled": True, "secret": None})
+
+        new_secret = normalize_secret(enroll_data["secret"])
+        new_factor_id = enroll_data["factor"]["id"]
+        enroll_session_id = enroll_data["session_id"]
+        masked_sec = f"{new_secret[:6]}...{new_secret[-4:]}" if len(new_secret) > 10 else new_secret
+        log(f"   ↳ [Safe-Lock] Khóa mới đã được tạo: {masked_sec}")
+
+        # Checkpoint callback immediately so caller never loses secret
+        if on_enroll is not None:
+            try:
+                await on_enroll({
+                    "secret": new_secret,
+                    "factor_id": new_factor_id,
+                    "session_id": enroll_session_id,
+                })
+            except Exception as exc_cb:
+                log(f"   ⚠️ [Cảnh báo lưu trữ]: {exc_cb}")
+
+        # Step 4: Activate new TOTP with Ultra-Resilient Retry
+        log("   ↳ Đang kích hoạt xác thực 2FA mới trên OpenAI...")
+        act_headers = {
+            **auth_headers,
+            "Content-Type": "application/json",
+        }
+        max_activate_retries = 10
+        activated_ok = False
+        first_code = ""
+
+        for attempt in range(1, max_activate_retries + 1):
+            first_code = generate_code(new_secret)
+            try:
+                act_response = await session.post(
+                    f"{_BASE}/accounts/mfa/user/activate_enrollment",
+                    headers=act_headers,
+                    data=json.dumps({
+                        "factor_id": new_factor_id,
+                        "factor_type": "totp",
+                        "session_id": enroll_session_id,
+                        "code": first_code,
+                    }),
+                    timeout=_HTTP_TIMEOUT,
+                )
+                body_text = act_response.text[:200] if hasattr(act_response, "text") else ""
+                if act_response.status_code == 200:
+                    activated_ok = True
+                    break
+                if _is_activate_idempotent_response(act_response.status_code, body_text):
+                    activated_ok = True
+                    break
+                if act_response.status_code == 401 and cookies:
+                    log(f"   ↳ [Safe-Lock] Token hết hạn (lần {attempt}/{max_activate_retries}) -> đang làm mới token...")
+                    new_token = await _refresh_access_token(session, cookies=cookies, log=log)
+                    if new_token:
+                        access_token = new_token
+                        auth_headers["Authorization"] = f"Bearer {access_token}"
+                        act_headers["Authorization"] = f"Bearer {access_token}"
+                else:
+                    log(f"   ⚠️ [Thử lại {attempt}/{max_activate_retries}] Kích hoạt 2FA HTTP {act_response.status_code}")
+            except Exception as exc:
+                log(f"   ⚠️ [Thử lại {attempt}/{max_activate_retries}] Lỗi kết nối kích hoạt: {exc}")
+
+            if attempt < max_activate_retries:
+                backoff = min(2.0 * attempt, 8.0)
+                await asyncio.sleep(backoff)
+
+        if not activated_ok:
+            err_msg = (
+                f"BÁO ĐỘNG ĐỎ: 2FA cũ đã tắt, đã sinh SECRET MỚI [{new_secret}] nhưng chưa kích hoạt được trên OpenAI! "
+                f"Cần giữ secret này để kích hoạt lại."
+            )
+            log(f"   ❌ [CRITICAL] {err_msg}")
+            raise MfaError(
+                err_msg,
+                partial_state={
+                    "is_old_disabled": True,
+                    "secret": new_secret,
+                    "factor_id": new_factor_id,
+                    "session_id": enroll_session_id,
+                },
+            )
+
+        log("   ↳ [Safe-Lock] Kích hoạt 2FA mới trên máy chủ OpenAI thành công!")
+        return {
+            "secret": new_secret,
+            "factor_id": new_factor_id,
+            "session_id": enroll_session_id,
+            "activated": True,
+            "first_code": first_code,
+            "mfa_info": mfa_info,
+        }
+    finally:
+        await client.close()
 
 
 async def enable_2fa(

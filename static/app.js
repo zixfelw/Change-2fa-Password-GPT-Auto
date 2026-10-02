@@ -365,8 +365,14 @@
       const payload = JSON.parse(data);
       if (payload.type === 'snapshot') {
         state.jobs.clear(); payload.jobs.forEach((job) => state.jobs.set(job.id, job));
-      } else if (payload.type === 'job') state.jobs.set(payload.job.id, payload.job);
-      else if (payload.type === 'removed') state.jobs.delete(payload.id);
+      } else if (payload.type === 'job') {
+        state.jobs.set(payload.job.id, payload.job);
+        if (state.selectedJob === payload.job.id && Array.isArray(payload.job.logs)) {
+          $('inline-log-content').textContent = payload.job.logs.join('\n') || 'Chưa có log.';
+          $('inline-log-status').innerHTML = `<span class="status ${payload.job.status}">${escapeHtml(statusLabel(payload.job))}</span>`;
+          $('inline-log-content').scrollTop = $('inline-log-content').scrollHeight;
+        }
+      } else if (payload.type === 'removed') state.jobs.delete(payload.id);
       render();
       refreshOutput();
     };
