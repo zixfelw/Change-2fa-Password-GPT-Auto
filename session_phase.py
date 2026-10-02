@@ -2013,21 +2013,61 @@ def _scrub_jwt(text: str) -> str:
     return _JWT_TOKEN_RE.sub("eyJ…[REDACTED]", text)
 
 
+def _normalize_plan_name(raw: Any) -> str | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    s = raw.strip().lower()
+    if s.startswith("chatgpt"):
+        s = s[len("chatgpt"):]
+    if s.endswith("plan"):
+        s = s[:-len("plan")]
+    return s or None
+
+
+def _ensure_ascii_cacert() -> None:
+    try:
+        import os
+        import shutil
+        import tempfile
+        import certifi
+
+        current_cacert = certifi.where()
+        try:
+            current_cacert.encode("ascii")
+            return
+        except UnicodeEncodeError:
+            pass
+
+        temp_cacert = os.path.join(tempfile.gettempdir(), "cacert.pem")
+        if not os.path.exists(temp_cacert) or os.path.getsize(temp_cacert) != os.path.getsize(current_cacert):
+            shutil.copyfile(current_cacert, temp_cacert)
+        os.environ["CURL_CA_BUNDLE"] = temp_cacert
+        os.environ["SSL_CERT_FILE"] = temp_cacert
+        certifi.where = lambda: temp_cacert
+    except Exception:
+        pass
+
+
 def _parse_entitlement_plan(data: dict[str, Any]) -> dict[str, Any]:
     """Parse entitlement block từ /backend-api/accounts/check/v4 → plan dict.
 
-    Pure (không network) nên dễ unit-test. Shape thực tế đã verify:
-        accounts.default.entitlement.{subscription_plan, has_active_subscription,
-                                      expires_at, subscription_id}
+    Shape thực tế từ OpenAI API:
+        accounts: {
+            <account_id>: {
+                account: { plan_type: "free"|"plus"|"team", plan_display_name: ... },
+                entitlement: { subscription_plan, has_active_subscription, expires_at, ... }
+            },
+            default: { ... }
+        }
+        account_ordering: [<primary_account_id>, ...]
 
-    ``subscription_plan`` (vd ``chatgptplusplan``) → label gọn: bỏ prefix
-    ``chatgpt`` + suffix ``plan`` → ``plus`` / ``free`` / ``team`` / ``pro`` …
-
-    ``is_plus`` strict Plus-only: chỉ True khi subscription active VÀ label là
-    đúng ``plus`` — Pro/Team/Enterprise active KHÔNG tính là Plus (badge dành
-    riêng nhãn Plus; auto-poll chỉ dừng khi thấy Plus thật).
-
-    Mọi shape thiếu/sai → trả blank (không raise) để caller fail-soft.
+    Quy tắc phân loại:
+    - Nếu has_active_subscription = True: gói là subscription_plan (e.g. plus/team/pro).
+      is_plus = True nếu gói đúng là "plus".
+    - Nếu has_active_subscription = False: subscription đã hết hạn hoặc chưa từng mua.
+      Gói thực tế hiện tại là "free", is_plus = False.
+    - Nếu tài khoản có nhiều account (Personal + Workspace), kiểm tra xem có workspace nào
+      đang active không để phản ánh đúng quyền lợi của user.
     """
     blank = {"plan": None, "is_plus": False, "has_active_subscription": False, "expires": None}
     if not isinstance(data, dict):
@@ -2035,32 +2075,60 @@ def _parse_entitlement_plan(data: dict[str, Any]) -> dict[str, Any]:
     accounts = data.get("accounts")
     if not isinstance(accounts, dict) or not accounts:
         return blank
-    acct = accounts.get("default")
+
+    acct = None
+    ordering = data.get("account_ordering")
+    if isinstance(ordering, list) and ordering:
+        first_id = ordering[0]
+        if first_id in accounts and isinstance(accounts[first_id], dict):
+            acct = accounts[first_id]
     if not isinstance(acct, dict):
-        # Không có key "default" → lấy account đầu tiên là dict.
+        acct = accounts.get("default")
+    if not isinstance(acct, dict):
         acct = next((v for v in accounts.values() if isinstance(v, dict)), None)
     if not isinstance(acct, dict):
         return blank
-    ent = acct.get("entitlement")
-    if not isinstance(ent, dict):
-        return blank
 
-    raw_plan = ent.get("subscription_plan")
-    label: str | None = None
-    if isinstance(raw_plan, str) and raw_plan.strip():
-        s = raw_plan.strip().lower()
-        if s.startswith("chatgpt"):
-            s = s[len("chatgpt"):]
-        if s.endswith("plan"):
-            s = s[: -len("plan")]
-        label = s or None
+    ent = acct.get("entitlement") if isinstance(acct.get("entitlement"), dict) else {}
+    account_info = acct.get("account") if isinstance(acct.get("account"), dict) else {}
+
+    raw_sub_plan = ent.get("subscription_plan")
+    sub_label = _normalize_plan_name(raw_sub_plan)
 
     has_active = bool(ent.get("has_active_subscription"))
+    expires_at = ent.get("expires_at")
+
+    if has_active:
+        plan = sub_label or _normalize_plan_name(account_info.get("plan_type")) or "plus"
+        return {
+            "plan": plan,
+            "is_plus": (plan == "plus"),
+            "has_active_subscription": True,
+            "expires": expires_at,
+        }
+
+    # Quét các account khác trong accounts (nếu có workspace Team/Plus đang active)
+    for acc_id, candidate in accounts.items():
+        if candidate is acct or not isinstance(candidate, dict):
+            continue
+        cand_ent = candidate.get("entitlement")
+        if isinstance(cand_ent, dict) and bool(cand_ent.get("has_active_subscription")):
+            cand_sub = _normalize_plan_name(cand_ent.get("subscription_plan"))
+            cand_acc = candidate.get("account") if isinstance(candidate.get("account"), dict) else {}
+            cand_plan = cand_sub or _normalize_plan_name(cand_acc.get("plan_type")) or "plus"
+            return {
+                "plan": cand_plan,
+                "is_plus": (cand_plan == "plus"),
+                "has_active_subscription": True,
+                "expires": cand_ent.get("expires_at"),
+            }
+
+    # Không có subscription active → Tài khoản hiện tại là FREE
     return {
-        "plan": label,
-        "is_plus": has_active and label == "plus",
-        "has_active_subscription": has_active,
-        "expires": ent.get("expires_at"),
+        "plan": "free",
+        "is_plus": False,
+        "has_active_subscription": False,
+        "expires": expires_at,
     }
 
 
@@ -2224,6 +2292,7 @@ async def fetch_account_entitlement(
             Error message KHÔNG kèm response body (endpoint identity/oauth có thể
             echo token vào body) và đã scrub mọi chuỗi prefix ``eyJ``.
     """
+    _ensure_ascii_cacert()
     from curl_cffi.requests import AsyncSession
     from user_agent_profile import (
         CURL_IMPERSONATE_PRIMARY,

@@ -174,13 +174,31 @@ class TwoFAService:
         ) from last_error
 
     @staticmethod
-    def _session_plan(session: dict[str, Any]) -> str | None:
-        top = session.get("accountPlan")
-        if isinstance(top, str) and top.strip():
-            return top.strip().casefold()
+    def _normalize_plan_label(value: Any) -> str | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        s = value.strip().casefold()
+        if s.startswith("chatgpt"):
+            s = s[len("chatgpt"):]
+        if s.endswith("plan"):
+            s = s[:-len("plan")]
+        return s or None
+
+    @classmethod
+    def _session_plan(cls, session: dict[str, Any]) -> str | None:
+        if not isinstance(session, dict):
+            return None
         account = session.get("account")
-        nested = account.get("planType") if isinstance(account, dict) else None
-        return nested.strip().casefold() if isinstance(nested, str) and nested.strip() else None
+        if isinstance(account, dict):
+            pt = account.get("planType")
+            normalized = cls._normalize_plan_label(pt)
+            if normalized:
+                return normalized
+        top = session.get("accountPlan")
+        normalized = cls._normalize_plan_label(top)
+        if normalized:
+            return normalized
+        return None
 
     async def _check_plan(
         self,
@@ -203,9 +221,17 @@ class TwoFAService:
                 ),
                 timeout=min(timeout, 25.0),
             )
-            plan = str(payload.get("plan") or "").strip().casefold()
-            if not plan:
-                plan = "plus" if payload.get("is_plus") is True else fallback or "free"
+            has_active = bool(payload.get("has_active_subscription"))
+            is_plus = bool(payload.get("is_plus"))
+            ent_plan = payload.get("plan")
+
+            if is_plus:
+                plan = "plus"
+            elif has_active and ent_plan:
+                plan = str(ent_plan).strip().casefold()
+            else:
+                plan = "free"
+
             log(f"[account] Tài khoản live · gói {plan.upper()}")
             return plan, "entitlement"
         except asyncio.CancelledError:
